@@ -93,10 +93,11 @@ Every course-related expense must link to a specific course/event in Monday.com 
                               [Course-Level P&L Report]
 ```
 
-**Monday.com Integration:**
-- Events stored in `monday_events` table (synced daily)
-- Each COS expense creates a subitem under the corresponding course
-- Revenue from course + all attributed expenses = Course P&L
+**Monday.com Integration (DEFERRED):**
+- **Status:** DEFERRED until QBO expense workflows are solid (2-3 weeks)
+- **Future:** Events will be queried via Monday.com API directly (NO local `monday_events` table)
+- **Future:** Each COS expense will create a subitem under the corresponding course
+- **Future:** Revenue from course + all attributed expenses = Course P&L
 
 **COS Categories (Cost of Sales):**
 - Fuel - COS
@@ -107,7 +108,8 @@ Every course-related expense must link to a specific course/event in Monday.com 
 - Supplies & Materials - COS
 - Cost of Labor - COS
 
-**Measurement:** 100% of COS expenses linked to a Monday.com course item.
+**Measurement (Phase 1):** 100% of expenses accurately posted to QBO with correct state/category.
+**Measurement (Phase 2):** 100% of COS expenses linked to Monday.com course item (after Phase 1 is stable).
 
 ---
 

@@ -1,21 +1,58 @@
 # AS3 Expense Automation - n8n Workflow Specification
 
-**Version:** 2.0
-**Last Updated:** December 6, 2025
-**Workflow ID:** ZZPC3jm6mXbLrp3u
+**Version:** 3.1 (Queue-Based Single-Expense Processing)
+**Last Updated:** December 16, 2025
+**Workflow ID:** ZZPC3jm6mXbLrp3u (Agent 1 - COMPLETE ✅), TBD (Agent 2), TBD (Agent 3)
 **Instance:** as3driving.app.n8n.cloud
+
+---
+
+## ⚠️ MAJOR ARCHITECTURE CHANGE: v3.0 Queue-Based Processing
+
+**Effective:** December 11, 2025
+
+**BREAKING CHANGE:** The workflow NO LONGER receives Zoho webhooks directly or processes multiple expenses in a loop.
+
+### Old Architecture (v2.0)
+- Zoho → n8n webhook → Loop over expenses → Process all in single execution
+- **Problem:** Memory exhaustion with 23+ expenses (188MB+ per execution)
+- **Problem:** Binary data (receipts) lost during loop iterations
+- **Problem:** One failed expense blocks entire report
+
+### New Architecture (v3.0)
+- Zoho → Supabase Edge Function → `zoho_expenses` table
+- Database trigger → n8n webhook (single `expense_id`)
+- n8n fetches ONE expense → Processes → Updates status
+- Queue controller manages max 5 concurrent executions
+
+### Benefits
+- **Memory isolation:** Each execution processes one expense with fresh memory
+- **Self-healing:** Failed expenses don't block others
+- **Observable:** All expense states visible in database (`status` column)
+- **Retryable:** Reset status to 'pending' to reprocess
+- **Scalable:** Handles reports of any size (tested up to 100+ expenses)
+- **Reliable:** No more binary data loss or iteration issues
+
+### Migration Impact
+- ✅ Zoho webhook goes to Supabase Edge Function (already deployed)
+- ✅ Database schema includes `zoho_expenses` table with queue controller trigger
+- ⚠️ **THIS DOCUMENT:** n8n workflow must be rebuilt to accept single expense_id
+- ⚠️ All loop-based patterns are deprecated
+
+See `expense-automation-architecture.md` for full details.
 
 ---
 
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Current Workflow Analysis](#current-workflow-analysis)
-3. [Revised Workflow Design](#revised-workflow-design)
-4. [Node Specifications](#node-specifications)
+2. [Code Node Best Practices](#code-node-best-practices)
+3. [Agent 1: Single-Expense Processor](#agent-1-single-expense-processor)
+4. [Agent 2: Orphan Processor](#agent-2-orphan-processor)
 5. [AI Agent Configuration](#ai-agent-configuration)
-6. [Error Handling](#error-handling)
-7. [Testing Strategy](#testing-strategy)
+6. [Queue Recovery Procedures](#queue-recovery-procedures)
+7. [Error Handling](#error-handling)
+8. [Testing Strategy](#testing-strategy)
 
 ---
 
@@ -23,590 +60,1042 @@
 
 ### Problem Statement
 
-The current n8n workflow hits the **10-iteration limit** because the AI Agent has 9 tools attached, requiring 8-9 tool calls per expense. This causes the workflow to fail with:
+The v2.0 workflow processed multiple expenses in a loop within a single n8n execution. This caused:
+
+1. **Memory exhaustion** with large reports (23+ expenses = 188MB+)
+2. **Binary data loss** when not explicitly preserved in Code nodes
+3. **Iteration limit failures** (AI agent hitting 10-iteration limit)
+4. **Blocking failures** (one bad expense blocks entire report)
+
+### Solution: Queue-Based Architecture
+
+Instead of processing all expenses in one execution, the new architecture:
+
+1. **Zoho webhook** → Supabase Edge Function (stores all expenses in database)
+2. **Database trigger** → Calls n8n for each expense (with `expense_id`)
+3. **n8n processes ONE expense** → Updates status → Trigger fires for next expense
+4. **Queue controller** limits concurrency to 5 simultaneous executions
+
+### Data Flow
 
 ```
-Max iterations (10) reached. The agent could not complete the task within the allowed number of iterations.
+┌─────────────────────────────────────────────────────────────────┐
+│                     Queue-Based Processing                      │
+└─────────────────────────────────────────────────────────────────┘
+
+[Zoho Webhook: Expense Report Approved]
+            │
+            ▼
+[Supabase Edge Function: store_zoho_expenses]
+   - Stores each expense in zoho_expenses table
+   - Status: 'pending'
+   - Receipt uploaded to Storage
+            │
+            ▼
+[Database Trigger: ON UPDATE status TO 'pending']
+   - Checks: COUNT(*) WHERE status = 'processing' < 5
+   - Updates: ONE expense SET status = 'processing'
+   - Calls: n8n webhook with expense_id via pg_net
+            │
+            ▼
+[n8n Workflow: POST /process-expense]
+   - Fetches expense from zoho_expenses
+   - Fetches receipt from Storage
+   - Matches to bank_transaction
+   - Posts to QBO
+   - Updates: status = 'posted' OR 'error' OR 'flagged'
+            │
+            ▼
+[Database Trigger: ON UPDATE status FROM 'processing']
+   - Detects: One expense finished
+   - Loops back: Processes next pending expense
 ```
 
-### Solution
+### Three Agent Workflows
 
-**Pre-fetch pattern:** Move all reference data lookups BEFORE the AI Agent, passing context in the prompt instead of via tool calls. Reduce agent tools from 9 to 3-4.
-
-| Before | After |
-|--------|-------|
-| 9 tools attached to agent | 3-4 tools attached |
-| Agent queries for each lookup | Context provided in prompt |
-| 8-9 iterations minimum | 3-4 iterations maximum |
-| Frequently hits limit | Never hits limit |
-
-### Two Workflows Required
-
-| Workflow | Trigger | Purpose |
-|----------|---------|---------|
-| **Flow A: Zoho Expense Processing** | Webhook (Zoho report approved) | Match Zoho expenses to existing bank transactions |
-| **Flow B: Orphan Bank Transaction Processing** | Schedule (daily) or Manual | Process bank transactions with no Zoho match |
-
-**Key Insight:** Bank transactions are imported FIRST as source of truth. Zoho expenses come in LATER and get matched TO existing bank transactions.
+| Agent | Trigger | Purpose | Volume |
+|-------|---------|---------|--------|
+| **Agent 1: Zoho Expense Processor** | Webhook (per expense) | Match single expense to bank, post to QBO | High (100-200/month) |
+| **Agent 2: Orphan & Recurring Processor** | Schedule (daily) | Process unmatched bank txns after 45 days | Low (10-20/month) |
+| **Agent 3: Income Reconciler** - DEFERRED | Schedule (daily) | Match STRIPE deposits to WooCommerce | TBD |
 
 ---
 
-## Current Workflow Analysis
+## Code Node Best Practices
 
-### Current Node Structure
+**NOTE:** Many v2.0 patterns are deprecated in v3.0 because we no longer process multiple expenses in a loop.
 
-```
-[Webhook] → [Split Out] → [Edit Fields] → [HTTP Request] → [Merge] → [AI Agent]
-                                                                         │
-                                          ┌──────────────────────────────┤
-                                          │ 9 TOOLS:                     │
-                                          │ 1. check_duplicate           │
-                                          │ 2. vendor_rules (Get)        │
-                                          │ 3. get_monday_events         │
-                                          │ 4. categorization_history    │
-                                          │ 5. flagged_expenses          │
-                                          │ 6. qbo_accounts              │
-                                          │ 7. check_qbo_duplicate       │
-                                          │ 8. post_to_qbo               │
-                                          │ 9. teams_notify              │
-                                          └──────────────────────────────┘
+### v3.0 Simplified Patterns (Single Expense)
+
+#### Pattern 1: Fetching Expense from Database
+
+```javascript
+// Get the single expense from Supabase query
+const expense = $('Fetch Expense').first().json;
+const expenseId = expense.id;
+const zohoCategoryName = expense.category_name;
+const amount = expense.amount;
 ```
 
-### Why It Fails
+#### Pattern 2: Using Receipt Binary Data
 
-For a single expense, the agent must call:
-1. `check_duplicate` - Verify not already processed
-2. `vendor_rules` - Check for known patterns
-3. `get_monday_events` - Find related course (for COS)
-4. `qbo_accounts` (2x) - Get payment account + expense account
-5. `check_qbo_duplicate` - Verify not in QBO
-6. `categorization_history` - Log the result
-7. `post_to_qbo` OR `flagged_expenses` - Final action
-8. `teams_notify` - If flagging
+```javascript
+// Receipt is already fetched from Storage as single item
+const receiptItem = $('Fetch Receipt').first();
+const receiptBinary = receiptItem.binary;
 
-**Total: 8-9 iterations minimum.** Any retry or error pushes over 10.
+// No need to preserve binary in loops - there is no loop!
+```
+
+#### Pattern 3: Preparing QBO Payload
+
+```javascript
+const expense = $('Fetch Expense').first().json;
+const vendor = $('Lookup Vendor').first().json;
+const qboClass = $('Fetch QBO Class').first().json;
+
+// Simple payload creation - no mapping needed
+return [{
+  json: {
+    VendorRef: { value: vendor.qbo_vendor_id },
+    TxnDate: expense.expense_date,
+    Line: [{
+      Amount: expense.amount,
+      DetailType: 'AccountBasedExpenseLineDetail',
+      AccountBasedExpenseLineDetail: {
+        AccountRef: { value: expense.qbo_account_id },
+        ClassRef: { value: qboClass.qbo_class_id }
+      }
+    }],
+    PrivateNote: `Zoho: ${expense.zoho_expense_id}`
+  }
+}];
+```
+
+### Deprecated v2.0 Patterns
+
+❌ **DO NOT USE:** `$runIndex` (no longer needed - no loop)
+❌ **DO NOT USE:** `.map()` over multiple expenses (single expense only)
+❌ **DO NOT USE:** Binary preservation patterns for loops (no loop to preserve through)
 
 ---
 
-## Revised Workflow Design
+## Agent 1: Single-Expense Processor
 
-### New Node Structure
+**Workflow ID:** ZZPC3jm6mXbLrp3u ✅ COMPLETE
+**Trigger:** `POST /process-expense { "expense_id": "uuid" }`
+**Called by:** Supabase `process_expense_queue()` trigger via `pg_net`
+**Status:** Production-ready, successfully processing expenses
 
+### December 16, 2025 Fixes
+
+**1. Bank Transaction Query - HTTP Request Pattern**
+
+The Supabase node could not handle date filtering correctly with ±3 days. Replaced with HTTP Request node using PostgREST query syntax.
+
+**Node Configuration:**
+- **Type:** `n8n-nodes-base.httpRequest`
+- **Method:** GET
+- **Authentication:** Supabase API (predefined credentials)
+- **URL:** `https://fzwozzqwyzztadxgjryl.supabase.co/rest/v1/bank_transactions`
+
+**Query Parameters:**
 ```
-[Webhook: Zoho]
-        │
-        ▼
-[Code: Parse Report Context]
-        │
-        ▼
-[Supabase: Fetch Reference Data] ────────────────────────────────┐
-        │                                                         │
-        │ Parallel queries:                                       │
-        │ ├── qbo_accounts (all)                                  │
-        │ ├── vendor_rules (all)                                  │
-        │ ├── monday_events (date filtered)                       │
-        │ └── bank_transactions (unmatched, date filtered)        │
-        │                                                         │
-        ▼                                                         │
-[Merge: Combine Reference Data] ◄─────────────────────────────────┘
-        │
-        ▼
-[Split Out: expenses array]
-        │
-        ▼
-[For Each Expense:]
-        │
-        ├──► [HTTP: Fetch Receipt Image]
-        │
-        ├──► [Supabase: Check Duplicate]
-        │           │
-        │           ▼
-        │    [IF: Already Exists?]
-        │           │
-        │    [Yes]──┴──[No]
-        │     │          │
-        │   [Skip]       ▼
-        │           [Merge: Combine All Context]
-        │                    │
-        │                    ▼
-        │           [AI Agent (Lean)]
-        │                    │
-        │           TOOLS (max 4):
-        │           ├── log_categorization
-        │           ├── match_bank_transaction
-        │           └── post_to_qbo OR queue_for_review
-        │
-        ▼
-[End Loop]
+select=id,transaction_date,description,amount,status,source,extracted_vendor
+status=eq.unmatched
+transaction_date=gte.{{ $json.date_start }}
+transaction_date=lte.{{ $json.date_end }}
 ```
 
-### Data Flow Summary
+**Headers:**
+- `apikey`: Supabase anon key (from credentials)
+- `Authorization`: `Bearer [service_role_key]` (from credentials)
+- `Prefer`: `return=representation`
 
-| Stage | Input | Output | Tool Calls |
-|-------|-------|--------|------------|
-| Parse Report | Zoho webhook JSON | Report context (COS/Non-COS, venue, dates) | 0 |
-| Fetch Reference | Report dates | qbo_accounts, vendor_rules, events, bank_txns | 0 (Supabase nodes) |
-| Per Expense | Expense + receipt | Categorization decision | 3-4 agent calls |
+**Date Calculation (Code Node Before Query):**
+```javascript
+const expense = $('Fetch Expense').first().json;
+const expenseDate = new Date(expense.expense_date);
 
----
+// Calculate ±3 days for bank transaction matching
+const dateStart = new Date(expenseDate);
+dateStart.setDate(dateStart.getDate() - 3);
 
-## Node Specifications
+const dateEnd = new Date(expenseDate);
+dateEnd.setDate(dateEnd.getDate() + 3);
 
-### Node 1: Webhook (Zoho)
+return [{
+  json: {
+    ...expense,
+    date_start: dateStart.toISOString().split('T')[0],
+    date_end: dateEnd.toISOString().split('T')[0]
+  }
+}];
+```
 
-**Type:** n8n-nodes-base.webhook
-**Purpose:** Receive expense reports from Zoho when approved
+**2. Data Flow After Supabase Update Nodes**
+
+Supabase update nodes return only their update confirmation, breaking the data chain. Solution: Reference earlier nodes explicitly.
+
+**Pattern:**
+```javascript
+// CORRECT: Reference earlier node explicitly
+const expense = $('Process QBO Accounts').first().json;
+const qboClass = $('Fetch QBO Class').first().json;
+const receiptBinary = $('Fetch Receipt').first()?.binary;
+
+// INCORRECT: This won't work after Supabase update
+const expense = $input.first().json;
+```
+
+**Example in "Prepare Purchase Payload" Node:**
+```javascript
+const expense = $('Process QBO Accounts').first().json;
+const vendor = $('Lookup Vendor').first().json;
+const qboClass = $('Fetch QBO Class').first().json;
+const bankMatch = $('Match Bank Transaction').first().json;
+
+return [{
+  json: {
+    AccountRef: { value: expense.paid_through.includes('AMEX') ? '99' : '49' },
+    PaymentType: expense.paid_through.includes('AMEX') ? 'CreditCard' : 'Check',
+    TxnDate: expense.expense_date,
+    EntityRef: { value: vendor.vendor_id },
+    Line: [{
+      Amount: expense.amount,
+      DetailType: 'AccountBasedExpenseLineDetail',
+      AccountBasedExpenseLineDetail: {
+        AccountRef: { value: expense.qbo_account_id },
+        ClassRef: { value: qboClass.qbo_class_id }
+      }
+    }],
+    PrivateNote: `Zoho: ${expense.zoho_expense_id} | State: ${expense.state_tag}`
+  }
+}];
+```
+
+**3. Filter Monday State Matching**
+
+When multiple Monday events match by date, prefer the one whose state matches the expense state.
+
+**Logic in "Filter Monday" Code Node:**
+```javascript
+const mondayItems = $input.all();
+const expense = $('Fetch Receipt').first().json;
+
+let bestMatch = null;
+let bestScore = 0;
+
+for (const item of mondayItems) {
+  const event = item.json;
+  let score = 100; // Base score for date match
+
+  // State matching bonus
+  if (event.state === expense.state_tag) {
+    score += 10; // Prefer events in same state
+  }
+
+  // Date proximity (closer = higher score)
+  const dateDiff = Math.abs(
+    new Date(event.start_date) - new Date(expense.expense_date)
+  ) / (1000 * 60 * 60 * 24);
+  score -= dateDiff;
+
+  if (score > bestScore) {
+    bestScore = score;
+    bestMatch = event;
+  }
+}
+
+return [{
+  json: {
+    ...expense,
+    monday_event: bestMatch,
+    monday_state: bestMatch?.state || null
+  },
+  binary: $('Fetch Receipt').first()?.binary
+}];
+```
+
+**4. Flag Reason Column**
+
+Added `flag_reason` TEXT column to `zoho_expenses` table to store why expenses are flagged.
+
+**Migration:**
+```sql
+ALTER TABLE zoho_expenses ADD COLUMN IF NOT EXISTS flag_reason TEXT;
+```
+
+**Usage in Workflow:**
+- Set when confidence < 95%
+- Set when no bank match found
+- Set when receipt validation fails
+- Displayed in Review Queue UI
+
+### Workflow Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                  Agent 1: Single-Expense Processor (v3.0)                   │
+│                  Trigger: POST /process-expense { expense_id }              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  [Webhook Trigger]
+         │
+         ▼
+  [Fetch Expense from zoho_expenses]
+         │
+         ▼
+  [IF status = 'processing']──NO──>[Exit: Already Processed]
+         │ YES
+         ▼
+  [Fetch Receipt from Storage]
+         │
+         ▼
+  [IF is COS?]──YES──>[Fetch Monday Event]──┐
+         │ NO                               │
+         │                                  │
+         ▼◄─────────────────────────────────┘
+  [Fetch Reference Data: Parallel]
+  ├─ bank_transactions (unmatched, ±3 days)
+  ├─ qbo_accounts
+  └─ qbo_classes
+         │
+         ▼
+  [AI Agent: Match & Categorize]
+  - Tools: NONE (all data pre-fetched)
+  - Output: matched bank_transaction_id, confidence, QBO account
+         │
+         ▼
+  [IF Match Found?]──NO──>[Flag for Review]──>[Update: status='flagged']──>[Exit]
+         │ YES
+         ▼
+  [IF Confidence >= 95%?]──NO──>[Flag for Review]──>[Update: status='flagged']──>[Exit]
+         │ YES
+         ▼
+  [Lookup/Create QBO Vendor]
+         │
+         ▼
+  [Fetch QBO Class (for state)]
+         │
+         ▼
+  [Create QBO Purchase]
+  - AccountRef: Payment account (AMEX or Wells Fargo)
+  - ExpenseLineDetail: Account + ClassRef
+  - EntityRef: Vendor
+         │
+         ▼
+  [Upload Receipt to QBO]
+  - Use Attachable API
+  - Binary data from Fetch Receipt step
+         │
+         ▼
+  [Update Bank Transaction]
+  UPDATE bank_transactions
+  SET status = 'matched',
+      matched_expense_id = zoho_expense_id,
+      qbo_purchase_id = purchase_id,
+      qbo_vendor_id = vendor_id
+  WHERE id = matched_bank_txn_id
+         │
+         ▼
+  [Update Expense Status]
+  UPDATE zoho_expenses
+  SET status = 'posted',
+      bank_transaction_id = matched_bank_txn_id,
+      qbo_purchase_id = purchase_id,
+      qbo_posted_at = NOW(),
+      processed_at = NOW()
+  WHERE id = expense_id
+         │
+         ▼
+  [Exit: Success]
+         │
+         └──On Error──>[Update: status='error', last_error]──>[Teams Notification]
+```
+
+### Node Specifications
+
+#### Node 1: Webhook Trigger
+
+**Type:** `n8n-nodes-base.webhook`
+**Purpose:** Receive single expense_id from queue controller
 
 **Configuration:**
 ```json
 {
-    "httpMethod": "POST",
-    "path": "491d3c57-4d67-4689-995d-e0070cb726a9",
-    "responseMode": "onReceived",
-    "options": {}
+  "httpMethod": "POST",
+  "path": "process-expense",
+  "responseMode": "lastNode",
+  "options": {}
 }
 ```
 
-**Output Structure:**
+**Expected Request Body:**
 ```json
 {
-    "body": {
-        "expense_report": {
-            "report_id": "5647323000000867001",
-            "report_name": "C24 - ACADS - CL - Aug 12-13",
-            "user_name": "Pablo Ortiz-Monasterio",
-            "start_date": "2024-08-12",
-            "end_date": "2024-08-13",
-            "expenses": [...]
-        }
-    }
+  "expense_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
 ---
 
-### Node 2: Parse Report Context (Code)
+#### Node 2: Fetch Expense
 
-**Type:** n8n-nodes-base.code
-**Purpose:** Extract report-level context to determine COS vs Non-COS and venue
+**Type:** `n8n-nodes-base.supabase`
+**Purpose:** Get full expense record from database
+
+**Configuration:**
+```json
+{
+  "operation": "getAll",
+  "tableId": "zoho_expenses",
+  "filters": {
+    "conditions": [
+      {
+        "keyName": "id",
+        "condition": "eq",
+        "keyValue": "={{ $json.body.expense_id }}"
+      }
+    ]
+  },
+  "options": {
+    "queryName": "single()"
+  }
+}
+```
+
+**Output Fields:**
+- `id` (UUID)
+- `zoho_expense_id` (string)
+- `zoho_report_id` (string)
+- `zoho_report_name` (string)
+- `category_name` (string)
+- `state_tag` (string)
+- `merchant_name` (string)
+- `amount` (numeric)
+- `expense_date` (date)
+- `paid_through` (string)
+- `receipt_storage_path` (string)
+- `status` (enum: 'pending', 'processing', 'posted', 'error', 'flagged')
+- `raw_payload` (jsonb - full Zoho expense object)
+
+---
+
+#### Node 3: Check Status
+
+**Type:** `n8n-nodes-base.if`
+**Purpose:** Prevent duplicate processing
+
+**Configuration:**
+```json
+{
+  "conditions": {
+    "string": [
+      {
+        "value1": "={{ $json.status }}",
+        "operation": "equals",
+        "value2": "processing"
+      }
+    ]
+  }
+}
+```
+
+**True Branch:** Continue processing
+**False Branch:** Exit (already processed or error state)
+
+---
+
+#### Node 4: Fetch Receipt
+
+**Type:** `n8n-nodes-base.supabase`
+**Operation:** Storage download
+
+**Configuration:**
+```json
+{
+  "operation": "download",
+  "bucketId": "expense-receipts",
+  "fileName": "={{ $json.receipt_storage_path }}"
+}
+```
+
+**Output:** Binary data (receipt image)
+
+---
+
+#### Node 5: IF is COS
+
+**Type:** `n8n-nodes-base.if`
+**Purpose:** Route to Monday.com venue lookup for Cost of Sales expenses
+
+**Configuration:**
+```json
+{
+  "conditions": {
+    "string": [
+      {
+        "value1": "={{ $json.category_name }}",
+        "operation": "contains",
+        "value2": "- COS"
+      }
+    ]
+  }
+}
+```
+
+**True Branch:** Fetch Monday Event
+**False Branch:** Skip to reference data fetch
+
+---
+
+#### Node 6: Fetch Monday Event (COS only)
+
+**Type:** `n8n-nodes-base.code`
+**Purpose:** Query Monday.com API for events overlapping expense date
 
 **JavaScript Code:**
 ```javascript
-const report = $json.body.expense_report;
-const reportName = report.report_name || '';
+const expense = $('Fetch Expense').first().json;
+const expenseDate = new Date(expense.expense_date);
 
-// Parse report name for context
-// Format: "C24 - ACADS - CL - Aug 12-13" or "Admin - Office Supplies - Nov 2024"
-
-const isCOS = reportName.match(/^C\d{2}\s*-/) !== null;
-
-// Extract venue code (for COS reports)
-const venueCodeMap = {
-    'LS': { venue: 'Laguna Seca', state: 'CA' },
-    'WS': { venue: 'Willow Springs', state: 'CA' },
-    'SON': { venue: 'Sonoma', state: 'CA' },
-    'CL': { venue: 'Crows Landing', state: 'CA' },
-    'TMS': { venue: 'Texas Motor Speedway', state: 'TX' },
-    'WCD': { venue: 'Western Colorado Dragway', state: 'CO' },
-    'ES': { venue: 'Evergreen Speedway', state: 'WA' },
-    'PR': { venue: 'Pacific Raceways', state: 'WA' },
-    'NJMP': { venue: 'New Jersey Motorsports Park', state: 'NJ' },
-    'SFF': { venue: 'South Florida Fairgrounds', state: 'FL' },
-    'GCF': { venue: 'Gallatin County Fairgrounds', state: 'MT' }
-};
-
-let venueCode = null;
-let venueInfo = null;
-
-for (const code of Object.keys(venueCodeMap)) {
-    if (reportName.includes(code)) {
-        venueCode = code;
-        venueInfo = venueCodeMap[code];
-        break;
+// Monday.com GraphQL query
+const query = `query {
+  items(board_ids: [8294758830]) {
+    id
+    name
+    column_values {
+      id
+      text
+      value
     }
-}
+  }
+}`;
 
-// Extract date range
-const startDate = report.start_date;
-const endDate = report.end_date;
+// Execute query via Monday.com HTTP Request node
+// Filter events where start_date <= expense_date <= end_date
+// Extract venue name and state
 
-// Calculate query date range (±7 days for bank transaction matching)
-const queryStartDate = new Date(startDate);
-queryStartDate.setDate(queryStartDate.getDate() - 7);
-const queryEndDate = new Date(endDate);
-queryEndDate.setDate(queryEndDate.getDate() + 7);
-
-return {
-    json: {
-        original: $json,
-        report_context: {
-            report_id: report.report_id,
-            report_name: reportName,
-            is_cos: isCOS,
-            venue_code: venueCode,
-            venue_name: venueInfo?.venue || null,
-            venue_state: venueInfo?.state || null,
-            start_date: startDate,
-            end_date: endDate,
-            query_start_date: queryStartDate.toISOString().split('T')[0],
-            query_end_date: queryEndDate.toISOString().split('T')[0],
-            submitter: report.user_name,
-            expense_count: report.expenses?.length || 0
-        },
-        expenses: report.expenses || []
-    }
-};
+// Return matched event or null
+return [{
+  json: {
+    ...expense,
+    monday_event_id: matchedEvent?.id || null,
+    monday_venue: matchedEvent?.venue || null,
+    monday_state: matchedEvent?.state || null
+  }
+}];
 ```
+
+**Note:** This may be replaced with HTTP Request node + Filter node for cleaner implementation.
 
 ---
 
-### Node 3: Fetch Reference Data (Supabase - Parallel)
+#### Node 7: Fetch Reference Data (Parallel)
 
-**Structure:** 4 parallel Supabase nodes merged together
+**Structure:** 3 parallel Supabase nodes
 
-#### Node 3a: Fetch QBO Accounts
+##### Node 7a: Fetch Bank Transactions
+
 ```json
 {
-    "operation": "getAll",
-    "tableId": "qbo_accounts",
-    "returnAll": true
+  "operation": "getAll",
+  "tableId": "bank_transactions",
+  "filters": {
+    "conditions": [
+      {
+        "keyName": "status",
+        "condition": "eq",
+        "keyValue": "unmatched"
+      },
+      {
+        "keyName": "transaction_date",
+        "condition": "gte",
+        "keyValue": "={{ DateTime.fromISO($json.expense_date).minus({days: 3}).toISODate() }}"
+      },
+      {
+        "keyName": "transaction_date",
+        "condition": "lte",
+        "keyValue": "={{ DateTime.fromISO($json.expense_date).plus({days: 3}).toISODate() }}"
+      }
+    ]
+  }
 }
 ```
 
-#### Node 3b: Fetch Vendor Rules
+##### Node 7b: Fetch QBO Accounts
+
 ```json
 {
-    "operation": "getAll",
-    "tableId": "vendor_rules",
-    "returnAll": true
+  "operation": "getAll",
+  "tableId": "qbo_accounts",
+  "returnAll": true
 }
 ```
 
-#### Node 3c: Fetch Monday Events (Filtered)
-```json
-{
-    "operation": "getAll",
-    "tableId": "monday_events",
-    "filters": {
-        "conditions": [
-            {
-                "keyName": "start_date",
-                "condition": "gte",
-                "keyValue": "={{ $json.report_context.query_start_date }}"
-            },
-            {
-                "keyName": "start_date",
-                "condition": "lte",
-                "keyValue": "={{ $json.report_context.query_end_date }}"
-            }
-        ]
-    }
-}
-```
+##### Node 7c: Fetch QBO Classes
 
-#### Node 3d: Fetch Bank Transactions (Unmatched)
 ```json
 {
-    "operation": "getAll",
-    "tableId": "bank_transactions",
-    "filters": {
-        "conditions": [
-            {
-                "keyName": "status",
-                "condition": "eq",
-                "keyValue": "unmatched"
-            },
-            {
-                "keyName": "transaction_date",
-                "condition": "gte",
-                "keyValue": "={{ $json.report_context.query_start_date }}"
-            },
-            {
-                "keyName": "transaction_date",
-                "condition": "lte",
-                "keyValue": "={{ $json.report_context.query_end_date }}"
-            }
-        ]
-    }
+  "operation": "getAll",
+  "tableId": "qbo_classes",
+  "returnAll": true
 }
 ```
 
 ---
 
-### Node 4: Merge Reference Data
+#### Node 8: AI Agent
 
-**Type:** n8n-nodes-base.merge
-**Mode:** Combine by position
-
-Combines outputs from all 4 reference data queries into a single object:
-
-```json
-{
-    "report_context": { ... },
-    "expenses": [ ... ],
-    "reference_data": {
-        "qbo_accounts": [ ... ],
-        "vendor_rules": [ ... ],
-        "monday_events": [ ... ],
-        "bank_transactions": [ ... ]
-    }
-}
-```
-
----
-
-### Node 5: Split Out Expenses
-
-**Type:** n8n-nodes-base.splitOut
-**Configuration:**
-```json
-{
-    "fieldToSplitOut": "expenses",
-    "options": {
-        "include": ["report_context", "reference_data"]
-    }
-}
-```
-
-Each iteration receives:
-- One expense object
-- Full report_context
-- All reference_data
-
----
-
-### Node 6: Fetch Receipt Image
-
-**Type:** n8n-nodes-base.httpRequest
-**Configuration:**
-```json
-{
-    "url": "https://www.zohoapis.com/expense/v1/expenses/{{ $json.expense_id }}/receipt",
-    "authentication": "oAuth2Api",
-    "sendHeaders": true,
-    "headerParameters": {
-        "parameters": [
-            {
-                "name": "X-com-zoho-expense-organizationid",
-                "value": "867260975"
-            }
-        ]
-    }
-}
-```
-
----
-
-### Node 7: Check Duplicate
-
-**Type:** n8n-nodes-base.supabase
-**Purpose:** Skip already-processed expenses (before invoking AI)
-
-```json
-{
-    "operation": "getAll",
-    "tableId": "categorization_history",
-    "filters": {
-        "conditions": [
-            {
-                "keyName": "zoho_expense_id",
-                "condition": "eq",
-                "keyValue": "={{ $json.expense_id }}"
-            }
-        ]
-    }
-}
-```
-
-**Logic:** If result.length > 0, skip to next expense.
-
----
-
-### Node 8: Merge All Context
-
-**Type:** n8n-nodes-base.merge
-**Purpose:** Combine expense, receipt, report_context, and reference_data for AI
-
-Output structure for AI Agent:
-```json
-{
-    "expense": {
-        "expense_id": "5647323000000867498",
-        "amount": 52.96,
-        "merchant_name": "Aho LLC",
-        "date": "2024-08-12",
-        "category_name": "Fuel - COS",
-        "description": "Fuel for course vehicle",
-        "state_tag": "California"
-    },
-    "receipt_image": "<binary data>",
-    "report_context": {
-        "is_cos": true,
-        "venue_code": "CL",
-        "venue_name": "Crows Landing",
-        "venue_state": "CA"
-    },
-    "reference_data": {
-        "qbo_accounts": [...],
-        "vendor_rules": [...],
-        "monday_events": [...],
-        "bank_transactions": [...]
-    }
-}
-```
-
----
-
-### Node 9: AI Agent (Lean)
-
-**Type:** @n8n/n8n-nodes-langchain.agent
+**Type:** `@n8n/n8n-nodes-langchain.agent`
 **Model:** Claude Sonnet 4.5 (claude-sonnet-4-5-20250929)
 
 **Configuration:**
 ```json
 {
-    "promptType": "define",
-    "options": {
-        "systemMessage": "<see AI Agent System Prompt below>",
-        "passthroughBinaryImages": true,
-        "maxIterations": 6
-    }
+  "promptType": "define",
+  "text": "<see AI Agent System Prompt below>",
+  "options": {
+    "systemMessage": "",
+    "passthroughBinaryImages": true,
+    "maxIterations": 6
+  }
 }
 ```
 
-**Tools (3-4 only):**
+**Tools:** NONE - All data is pre-fetched and provided in prompt
 
-#### Tool 1: log_categorization (Supabase Insert)
+**Input Data:**
+- Expense record (from Fetch Expense)
+- Receipt image (binary)
+- Reference data (bank_transactions, qbo_accounts, qbo_classes)
+- Monday event (if COS)
+
+**Output Expected (JSON):**
 ```json
 {
-    "toolDescription": "Log expense categorization to categorization_history. ALWAYS call this.",
-    "operation": "insert",
-    "tableId": "categorization_history",
-    "fieldsUi": {
-        "fieldValues": [
-            {"fieldId": "source", "fieldValue": "={{ $fromAI('source', 'Always zoho', 'string', 'zoho') }}"},
-            {"fieldId": "transaction_date", "fieldValue": "={{ $fromAI('transaction_date') }}"},
-            {"fieldId": "vendor_raw", "fieldValue": "={{ $fromAI('vendor_raw') }}"},
-            {"fieldId": "vendor_clean", "fieldValue": "={{ $fromAI('vendor_clean') }}"},
-            {"fieldId": "amount", "fieldValue": "={{ $fromAI('amount', 'number') }}"},
-            {"fieldId": "predicted_category", "fieldValue": "={{ $fromAI('predicted_category') }}"},
-            {"fieldId": "predicted_state", "fieldValue": "={{ $fromAI('predicted_state') }}"},
-            {"fieldId": "predicted_confidence", "fieldValue": "={{ $fromAI('predicted_confidence', 'number') }}"},
-            {"fieldId": "zoho_expense_id", "fieldValue": "={{ $fromAI('zoho_expense_id') }}"},
-            {"fieldId": "receipt_validated", "fieldValue": "={{ $fromAI('receipt_validated', 'boolean') }}"},
-            {"fieldId": "receipt_amount", "fieldValue": "={{ $fromAI('receipt_amount', 'number') }}"},
-            {"fieldId": "bank_transaction_id", "fieldValue": "={{ $fromAI('bank_transaction_id') }}"},
-            {"fieldId": "monday_event_id", "fieldValue": "={{ $fromAI('monday_event_id') }}"},
-            {"fieldId": "venue_name", "fieldValue": "={{ $fromAI('venue_name') }}"},
-            {"fieldId": "venue_state", "fieldValue": "={{ $fromAI('venue_state') }}"}
-        ]
-    }
-}
-```
-
-#### Tool 2: match_bank_transaction (Supabase Update)
-```json
-{
-    "toolDescription": "Mark a bank transaction as matched. Call when you find a matching transaction.",
-    "operation": "update",
-    "tableId": "bank_transactions",
-    "matchingColumns": ["id"],
-    "fieldsUi": {
-        "fieldValues": [
-            {"fieldId": "id", "fieldValue": "={{ $fromAI('bank_txn_id', 'UUID of the bank transaction') }}"},
-            {"fieldId": "status", "fieldValue": "matched"},
-            {"fieldId": "matched_expense_id", "fieldValue": "={{ $fromAI('zoho_expense_id') }}"},
-            {"fieldId": "matched_at", "fieldValue": "={{ new Date().toISOString() }}"},
-            {"fieldId": "matched_by", "fieldValue": "agent"},
-            {"fieldId": "match_confidence", "fieldValue": "={{ $fromAI('match_confidence', 'number') }}"}
-        ]
-    }
-}
-```
-
-#### Tool 3: post_to_qbo (HTTP Request)
-```json
-{
-    "toolDescription": "Post approved expense to QuickBooks. Only use when confidence >= 95 AND bank match found.",
-    "method": "POST",
-    "url": "https://quickbooks.api.intuit.com/v3/company/123146088634019/purchase?minorversion=65",
-    "authentication": "quickBooksOAuth2Api",
-    "sendBody": true,
-    "specifyBody": "json",
-    "jsonBody": "={{ JSON.stringify({ ... }) }}"
-}
-```
-
-#### Tool 4: queue_for_review (Supabase Insert)
-```json
-{
-    "toolDescription": "Queue expense for human review. Use when confidence < 95 OR no bank match.",
-    "operation": "insert",
-    "tableId": "expense_queue",
-    "fieldsUi": {
-        "fieldValues": [
-            {"fieldId": "zoho_expense_id", "fieldValue": "={{ $fromAI('zoho_expense_id') }}"},
-            {"fieldId": "zoho_report_name", "fieldValue": "={{ $fromAI('report_name') }}"},
-            {"fieldId": "vendor_name", "fieldValue": "={{ $fromAI('vendor_name') }}"},
-            {"fieldId": "amount", "fieldValue": "={{ $fromAI('amount', 'number') }}"},
-            {"fieldId": "expense_date", "fieldValue": "={{ $fromAI('expense_date') }}"},
-            {"fieldId": "category_suggested", "fieldValue": "={{ $fromAI('category_suggested') }}"},
-            {"fieldId": "state_suggested", "fieldValue": "={{ $fromAI('state_suggested') }}"},
-            {"fieldId": "confidence_score", "fieldValue": "={{ $fromAI('confidence_score', 'number') }}"},
-            {"fieldId": "flag_reason", "fieldValue": "={{ $fromAI('flag_reason') }}"},
-            {"fieldId": "suggested_bank_txn_id", "fieldValue": "={{ $fromAI('suggested_bank_txn_id') }}"},
-            {"fieldId": "receipt_url", "fieldValue": "={{ $fromAI('receipt_url') }}"},
-            {"fieldId": "original_data", "fieldValue": "={{ $fromAI('original_data') }}"}
-        ]
-    }
+  "matched_bank_txn_id": "uuid or null",
+  "match_confidence": 95,
+  "qbo_account_id": "35",
+  "qbo_class_id": "1000000004",
+  "state_code": "CA",
+  "flag_reason": "null or reason string"
 }
 ```
 
 ---
 
-## AI Agent Configuration
+#### Node 9: IF Match Found
 
-### System Prompt
+**Type:** `n8n-nodes-base.if`
+
+**Configuration:**
+```json
+{
+  "conditions": {
+    "boolean": [
+      {
+        "value1": "={{ $json.matched_bank_txn_id !== null }}",
+        "value2": true
+      }
+    ]
+  }
+}
+```
+
+**False Branch:** Flag for Review → Update status='flagged' → Exit
+
+---
+
+#### Node 10: IF Confidence >= 95%
+
+**Type:** `n8n-nodes-base.if`
+
+**Configuration:**
+```json
+{
+  "conditions": {
+    "number": [
+      {
+        "value1": "={{ $json.match_confidence }}",
+        "operation": "largerEqual",
+        "value2": 95
+      }
+    ]
+  }
+}
+```
+
+**False Branch:** Flag for Review → Update status='flagged' → Exit
+
+---
+
+#### Node 11: Lookup/Create QBO Vendor
+
+**Structure:** 3 nodes (Query → IF Exists → Create)
+
+##### Node 11a: Query Vendor
+
+**Type:** `n8n-nodes-base.httpRequest`
+**Method:** GET
+**URL:** `https://quickbooks.api.intuit.com/v3/company/123146088634019/query`
+
+**Query Parameters:**
+```
+query: SELECT * FROM Vendor WHERE DisplayName = '{{ $json.merchant_name }}'
+```
+
+##### Node 11b: IF Vendor Exists
+
+**Type:** `n8n-nodes-base.if`
+
+Check if `QueryResponse.Vendor.length > 0`
+
+##### Node 11c: Create Vendor (if not exists)
+
+**Type:** `n8n-nodes-base.httpRequest`
+**Method:** POST
+**URL:** `https://quickbooks.api.intuit.com/v3/company/123146088634019/vendor`
+
+**Body:**
+```json
+{
+  "DisplayName": "{{ $json.merchant_name }}",
+  "Active": true
+}
+```
+
+---
+
+#### Node 12: Fetch QBO Class
+
+**Type:** `n8n-nodes-base.supabase`
+**Purpose:** Get ClassRef value for state
+
+**Configuration:**
+```json
+{
+  "operation": "getAll",
+  "tableId": "qbo_classes",
+  "filters": {
+    "conditions": [
+      {
+        "keyName": "state_code",
+        "condition": "eq",
+        "keyValue": "={{ $json.state_code }}"
+      }
+    ]
+  },
+  "options": {
+    "queryName": "single()"
+  }
+}
+```
+
+---
+
+#### Node 13: Create QBO Purchase
+
+**Type:** `n8n-nodes-base.httpRequest`
+**Method:** POST
+**URL:** `https://quickbooks.api.intuit.com/v3/company/123146088634019/purchase?minorversion=65`
+**Authentication:** quickBooksOAuth2Api
+
+**Body:**
+```json
+{
+  "AccountRef": {
+    "value": "={{ $json.paid_through.includes('AMEX') ? '99' : '49' }}"
+  },
+  "PaymentType": "={{ $json.paid_through.includes('AMEX') ? 'CreditCard' : 'Check' }}",
+  "TxnDate": "={{ $json.expense_date }}",
+  "EntityRef": {
+    "value": "={{ $json.vendor_id }}"
+  },
+  "Line": [{
+    "Amount": {{ $json.amount }},
+    "DetailType": "AccountBasedExpenseLineDetail",
+    "AccountBasedExpenseLineDetail": {
+      "AccountRef": { "value": "{{ $json.qbo_account_id }}" },
+      "ClassRef": { "value": "{{ $json.qbo_class_id }}" }
+    }
+  }],
+  "PrivateNote": "Zoho: {{ $json.zoho_expense_id }}"
+}
+```
+
+**Output:**
+```json
+{
+  "Purchase": {
+    "Id": "123",
+    "...": "..."
+  }
+}
+```
+
+---
+
+#### Node 14: Upload Receipt to QBO
+
+**Type:** `n8n-nodes-base.httpRequest`
+**Method:** POST
+**URL:** `https://quickbooks.api.intuit.com/v3/company/123146088634019/upload?minorversion=65`
+**Authentication:** quickBooksOAuth2Api
+**Content-Type:** multipart/form-data
+
+**Body:**
+- `file_metadata_01`: Attachable JSON
+- `file_content_01`: Receipt binary data
+
+**Attachable JSON:**
+```json
+{
+  "AttachableRef": [{
+    "EntityRef": {
+      "type": "Purchase",
+      "value": "{{ $json.purchase_id }}"
+    }
+  }],
+  "FileName": "receipt_{{ $json.zoho_expense_id }}.jpg"
+}
+```
+
+**Note:** Only execute if receipt exists (IF node before this).
+
+---
+
+#### Node 15: Update Bank Transaction
+
+**Type:** `n8n-nodes-base.supabase`
+**Operation:** Update
+
+**Configuration:**
+```json
+{
+  "operation": "update",
+  "tableId": "bank_transactions",
+  "filterType": "id",
+  "id": "={{ $json.matched_bank_txn_id }}",
+  "fieldsUi": {
+    "fieldValues": [
+      { "fieldId": "status", "fieldValue": "matched" },
+      { "fieldId": "matched_expense_id", "fieldValue": "={{ $json.zoho_expense_id }}" },
+      { "fieldId": "matched_at", "fieldValue": "={{ $now.toISO() }}" },
+      { "fieldId": "matched_by", "fieldValue": "agent" },
+      { "fieldId": "match_confidence", "fieldValue": "={{ $json.match_confidence }}" },
+      { "fieldId": "qbo_purchase_id", "fieldValue": "={{ $json.purchase_id }}" },
+      { "fieldId": "qbo_vendor_id", "fieldValue": "={{ $json.vendor_id }}" }
+    ]
+  }
+}
+```
+
+---
+
+#### Node 16: Update Expense Status (Success)
+
+**Type:** `n8n-nodes-base.supabase`
+**Operation:** Update
+
+**Configuration:**
+```json
+{
+  "operation": "update",
+  "tableId": "zoho_expenses",
+  "filterType": "id",
+  "id": "={{ $json.expense_id }}",
+  "fieldsUi": {
+    "fieldValues": [
+      { "fieldId": "status", "fieldValue": "posted" },
+      { "fieldId": "bank_transaction_id", "fieldValue": "={{ $json.matched_bank_txn_id }}" },
+      { "fieldId": "qbo_purchase_id", "fieldValue": "={{ $json.purchase_id }}" },
+      { "fieldId": "qbo_posted_at", "fieldValue": "={{ $now.toISO() }}" },
+      { "fieldId": "processed_at", "fieldValue": "={{ $now.toISO() }}" }
+    ]
+  }
+}
+```
+
+**CRITICAL:** This UPDATE triggers the queue controller to process the next expense.
+
+---
+
+#### Node 17: Error Handler (Global)
+
+**Type:** `n8n-nodes-base.supabase` (Update on error)
+**Triggered by:** Error trigger on any node
+
+**Configuration:**
+```json
+{
+  "operation": "update",
+  "tableId": "zoho_expenses",
+  "filterType": "id",
+  "id": "={{ $json.expense_id }}",
+  "fieldsUi": {
+    "fieldValues": [
+      { "fieldId": "status", "fieldValue": "error" },
+      { "fieldId": "last_error", "fieldValue": "={{ $json.error.message }}" },
+      { "fieldId": "processing_attempts", "fieldValue": "={{ $json.processing_attempts + 1 }}" },
+      { "fieldId": "processed_at", "fieldValue": "={{ $now.toISO() }}" }
+    ]
+  }
+}
+```
+
+**Also:** Send Teams notification with error details.
+
+---
+
+#### Node 18: Flag for Review (Low Confidence)
+
+**Type:** `n8n-nodes-base.supabase`
+**Operation:** Insert
+
+**Configuration:**
+```json
+{
+  "operation": "insert",
+  "tableId": "expense_queue",
+  "fieldsUi": {
+    "fieldValues": [
+      { "fieldId": "zoho_expense_id", "fieldValue": "={{ $json.zoho_expense_id }}" },
+      { "fieldId": "zoho_report_name", "fieldValue": "={{ $json.zoho_report_name }}" },
+      { "fieldId": "vendor_name", "fieldValue": "={{ $json.merchant_name }}" },
+      { "fieldId": "amount", "fieldValue": "={{ $json.amount }}" },
+      { "fieldId": "expense_date", "fieldValue": "={{ $json.expense_date }}" },
+      { "fieldId": "category_suggested", "fieldValue": "={{ $json.category_name }}" },
+      { "fieldId": "state_suggested", "fieldValue": "={{ $json.state_tag }}" },
+      { "fieldId": "confidence_score", "fieldValue": "={{ $json.match_confidence }}" },
+      { "fieldId": "flag_reason", "fieldValue": "={{ $json.flag_reason }}" },
+      { "fieldId": "suggested_bank_txn_id", "fieldValue": "={{ $json.matched_bank_txn_id }}" },
+      { "fieldId": "original_data", "fieldValue": "={{ JSON.stringify($json) }}" }
+    ]
+  }
+}
+```
+
+**Then:** Update zoho_expenses status='flagged' and exit.
+
+---
+
+## Agent 2: Orphan Processor
+
+**Status:** TO BE BUILT (v3.0 compatible)
+**Trigger:** Schedule (daily) or Manual
+**Purpose:** Process unmatched bank transactions after 45-day grace period
+
+### Architecture Note
+
+Agent 2 handles a LOW VOLUME of orphaned transactions (typically <10 per week). Therefore, **loop-based processing is acceptable** for Agent 2.
+
+**Agent 2 can use the v2.0 loop patterns** because:
+- Small batch size (rarely exceeds 20 items)
+- No receipt binary data to preserve
+- Already has all reference data (vendor_rules, qbo_accounts)
+
+### Workflow Overview (Loop-Based)
 
 ```
-You are an expense categorization agent for AS3 Driver Training. You process expenses from Zoho and match them to bank transactions.
+[Schedule Trigger: Daily 6 AM]
+        │
+        ▼
+[Supabase: Query Orphan Transactions]
+  WHERE status = 'unmatched'
+    AND transaction_date < NOW() - 45 days
+        │
+        ▼
+[Fetch Reference Data: Parallel]
+  ├─ vendor_rules
+  ├─ qbo_accounts
+  └─ qbo_classes
+        │
+        ▼
+[Split Out: Loop Over Orphan Transactions]
+        │
+        ▼
+[Code: State Determination Waterfall]
+  1. Check vendor_rules for pattern match
+  2. Parse description for city/state
+  3. Check date proximity to courses
+  4. Cannot determine → needs_review = true
+        │
+        ▼
+[IF: State Determined?]
+        │
+   YES  │  NO
+    │   └───>[Queue for Human Review]
+    ▼
+[Lookup/Create QBO Vendor]
+    ▼
+[Create QBO Purchase]
+    ▼
+[Update bank_transactions: status='orphan_processed']
+    ▼
+[End Loop]
+```
 
-## IMPORTANT: All reference data is provided below. DO NOT query for this data.
+**NOTE:** Full specifications for Agent 2 will be documented after Agent 1 is rebuilt and tested.
 
-### QBO Accounts (use these qbo_id values):
-{{ JSON.stringify($json.reference_data.qbo_accounts) }}
+---
 
-### Vendor Rules (known patterns):
-{{ JSON.stringify($json.reference_data.vendor_rules) }}
+## AI Agent Configuration
 
-### Monday Events (nearby courses):
-{{ JSON.stringify($json.reference_data.monday_events) }}
+### Agent 1 System Prompt
 
-### Unmatched Bank Transactions:
-{{ JSON.stringify($json.reference_data.bank_transactions) }}
+```
+You are Agent 1: Zoho Expense Processor for AS3 Driver Training.
 
-## REPORT CONTEXT
-- Report Name: {{ $json.report_context.report_name }}
-- Is COS (Course-Related): {{ $json.report_context.is_cos }}
-- Venue: {{ $json.report_context.venue_name }} ({{ $json.report_context.venue_state }})
-- Date Range: {{ $json.report_context.start_date }} to {{ $json.report_context.end_date }}
+Your job: Match a single approved Zoho expense to an existing bank transaction and prepare it for QuickBooks Online posting.
 
-## CURRENT EXPENSE
-- Expense ID: {{ $json.expense.expense_id }}
+## CRITICAL: You have NO tools
+
+All reference data has been pre-fetched and is provided in your context. You do NOT need to query anything.
+
+Your output will be used by subsequent n8n nodes to:
+1. Post the Purchase to QBO
+2. Update the bank transaction
+3. Upload the receipt
+
+## INPUT DATA PROVIDED
+
+### Expense Record:
+- Zoho Expense ID: {{ $json.expense.zoho_expense_id }}
 - Amount: ${{ $json.expense.amount }}
 - Merchant: {{ $json.expense.merchant_name }}
-- Date: {{ $json.expense.date }}
+- Date: {{ $json.expense.expense_date }}
 - Category: {{ $json.expense.category_name }}
 - State Tag: {{ $json.expense.state_tag }}
+- Paid Through: {{ $json.expense.paid_through }}
 - Description: {{ $json.expense.description }}
 
-The receipt image is attached.
+### Receipt Image:
+The receipt image is attached as binary data. Analyze it for:
+- Amount validation
+- Merchant name confirmation
+- Date verification
+- Location (if visible)
+
+### Unmatched Bank Transactions (within ±3 days):
+{{ JSON.stringify($json.reference_data.bank_transactions, null, 2) }}
+
+### QBO Accounts (for expense account lookup):
+{{ JSON.stringify($json.reference_data.qbo_accounts, null, 2) }}
+
+### QBO Classes (for state ClassRef):
+{{ JSON.stringify($json.reference_data.qbo_classes, null, 2) }}
+
+### Monday Event (if COS expense):
+{{ $json.monday_event ? JSON.stringify($json.monday_event, null, 2) : 'Not applicable (Non-COS expense)' }}
 
 ---
 
 ## YOUR DECISION PROCESS
 
 ### Step 1: Analyze Receipt
+
 Extract from the receipt image:
 - Amount shown
 - Merchant name
@@ -616,386 +1105,361 @@ Extract from the receipt image:
 Compare receipt amount to claimed amount ({{ $json.expense.amount }}).
 
 ### Step 2: Find Bank Transaction Match
-Search the provided bank_transactions for a match where:
+
+Search the provided bank_transactions for the BEST match where:
 - Amount matches within $0.50
-- Date within 5 days of expense date
+- Date within ±3 days of expense date ({{ $json.expense.expense_date }})
 - Description contains similar vendor name
 
-If multiple matches, pick the closest by date and amount.
-If no match found, note this for flagging.
+If multiple matches, pick the closest by:
+1. Exact amount match first
+2. Then closest date
+3. Then best vendor name match
 
-### Step 3: Validate Category
-Check if category_name matches report type:
-- COS report (is_cos=true) should have categories ending in "- COS"
-- Non-COS report should NOT have "- COS" categories
+If NO match found, set `matched_bank_txn_id: null` and provide `flag_reason`.
 
-Check vendor_rules for known patterns that override category.
+### Step 3: Determine QBO Account
 
-### Step 4: Determine State
-For COS expenses:
-- Use venue_state from report_context: {{ $json.report_context.venue_state }}
+Look up the qbo_accounts array for a record where:
+- `zoho_category_match` contains the expense's `category_name`
+
+Example:
+- If category_name = "Fuel - COS", find record with zoho_category_match = "Fuel - COS"
+- Use that record's `qbo_id` value
+
+### Step 4: Determine State and Class
+
+For COS expenses (category contains "- COS"):
+- Use `monday_event.state` if available
+- Otherwise use `state_tag` from expense
 
 For Non-COS expenses:
-- Use state_tag from Zoho: {{ $json.expense.state_tag }}
-- If unclear, use "Admin"
+- Use `state_tag` from expense
+- If "Other" → Use "NC" (North Carolina - admin state)
+
+Look up the qbo_classes array for a record where:
+- `state_code` matches the determined state
+
+Use that record's `qbo_class_id` value.
 
 ### Step 5: Calculate Confidence (0-100)
+
 Start at 100, subtract for issues:
 - No bank transaction match: -40
 - Receipt amount mismatch (>$1 difference): -30
 - No receipt image or unreadable: -25
-- COS expense with no Monday event: -40
-- State unclear or mismatch: -20
-- Category mismatch with report type: -15
-- Vendor not in rules: -5
+- COS expense with no Monday event: -20
+- State unclear: -20
+- Category not found in qbo_accounts: -15
+- Merchant name very different: -10
 
-### Step 6: Make Decision
+### Step 6: Output Decision
 
-**IF confidence >= 95 AND bank_transaction match found:**
-1. Call log_categorization (REQUIRED)
-2. Call match_bank_transaction to mark the bank txn as matched
-3. Call post_to_qbo to create Purchase record
+Return a JSON object with:
 
-**ELSE (confidence < 95 OR no bank match):**
-1. Call log_categorization (REQUIRED)
-2. Call queue_for_review to flag for human review
-
----
-
-## TOOL USAGE RULES
-
-1. ALWAYS call log_categorization first
-2. Call match_bank_transaction BEFORE post_to_qbo if you found a match
-3. Call EITHER post_to_qbo OR queue_for_review, never both
-4. Maximum 4 tool calls per expense
-
----
-
-## QBO ACCOUNT LOOKUP
-
-When posting to QBO, look up these IDs from qbo_accounts:
-
-Payment Account (AccountRef.value):
-- paid_through contains "AMEX" → qbo_id: "99", PaymentType: "CreditCard"
-- paid_through contains "Wells Fargo" → qbo_id: "49", PaymentType: "Check"
-
-Expense Account (Line[0].AccountBasedExpenseLineDetail.AccountRef.value):
-- Match category_name to zoho_category_match in qbo_accounts
-- Use the corresponding qbo_id
-
----
-
-## FINAL RESPONSE FORMAT
-
-After completing tool calls, respond with:
-
-```
-Expense: [merchant] - $[amount]
-Bank Match: [Yes/No] - [bank_txn_id or "Not found"]
-Category: [category]
-State: [state_code]
-Confidence: [score]%
-Result: [Posted to QBO (ID: xxx)] or [Queued for review: reason]
-```
-```
-
----
-
-## Flow B: Orphan Bank Transaction Processing
-
-### Overview
-
-This workflow handles bank transactions that have no corresponding Zoho expense after a grace period. These are legitimate business expenses paid by corporate card but not submitted through Zoho.
-
-**Triggers:**
-- Scheduled: Run daily at 6 AM
-- Manual: Button in web app to process orphans on demand
-
-**Grace Period:** 5 days from transaction_date (allows time for employee to submit expense)
-
-### Workflow Structure
-
-```
-[Schedule Trigger: Daily 6 AM] or [Webhook: Manual Trigger]
-        │
-        ▼
-[Supabase: Query Orphan Transactions]
-    - WHERE status = 'unmatched'
-    - AND transaction_date < NOW() - 5 days
-    - AND source IN ('amex', 'wells_fargo')
-        │
-        ▼
-[Supabase: Fetch Reference Data - Parallel]
-    ├── vendor_rules (all)
-    ├── qbo_accounts (all)
-    └── monday_events (date range from orphan batch)
-        │
-        ▼
-[Split: For Each Orphan Transaction]
-        │
-        ▼
-[Code: State Determination Waterfall]
-    1. Check vendor_rules for matching pattern
-       → Use vendor_rules.default_state
-    2. Parse description for city/state
-       → Extract state code from bank description
-    3. Check date proximity to courses
-       → If within ±2 days of a course, use course state
-    4. Cannot determine
-       → Set needs_review = true
-        │
-        ▼
-[IF: State Determined?]
-    │
-    ├── [YES] ─────────────────────────────────────────────┐
-    │       │                                               │
-    │       ▼                                               │
-    │   [Code: Determine Category]                          │
-    │       - Check vendor_rules.default_category           │
-    │       - Fall back to parsing description              │
-    │       - Unknown = flag for review                     │
-    │       │                                               │
-    │       ▼                                               │
-    │   [IF: Category Determined?]                          │
-    │       │                                               │
-    │       ├── [YES] → [POST to QBO]                       │
-    │       │              │                                │
-    │       │              ▼                                │
-    │       │          [Update bank_transactions]           │
-    │       │              - status = 'orphan_processed'    │
-    │       │              - qbo_purchase_id = [returned]   │
-    │       │              │                                │
-    │       │              ▼                                │
-    │       │          [IF: is_cos_category?]               │
-    │       │              │                                │
-    │       │              ├── [YES] → [Create Monday subitem]
-    │       │              └── [NO]  → [Done]               │
-    │       │                                               │
-    │       └── [NO] → [Queue for Orphan Review]            │
-    │                                                       │
-    └── [NO] ──────────────────────────────────────────────┘
-            │
-            ▼
-    [Insert to orphan_queue in web app]
-        - bank_transaction_id
-        - suggested_state (if partial match)
-        - suggested_category (if partial match)
-        - needs_state = true/false
-        - needs_category = true/false
-```
-
-### Node Specifications for Flow B
-
-#### Node B1: Schedule Trigger
 ```json
 {
-    "type": "n8n-nodes-base.scheduleTrigger",
-    "parameters": {
-        "rule": {
-            "interval": [
-                {
-                    "field": "hours",
-                    "hoursInterval": 24,
-                    "triggerAtHour": 6
-                }
-            ]
-        }
-    }
+  "matched_bank_txn_id": "uuid or null",
+  "match_confidence": 95,
+  "qbo_account_id": "35",
+  "qbo_class_id": "1000000004",
+  "state_code": "CA",
+  "flag_reason": "null or reason string",
+  "receipt_amount_matches": true,
+  "receipt_merchant_matches": true
 }
 ```
 
-#### Node B2: Query Orphan Transactions
+**Confidence Rules:**
+- >= 95%: Will be posted to QBO automatically
+- < 95%: Will be flagged for human review
+
+**Flag Reasons (if confidence < 95%):**
+- "No bank match found"
+- "Receipt amount mismatch: receipt shows $X, expense claims $Y"
+- "Receipt unreadable"
+- "COS expense without Monday event"
+- "State unclear"
+- "Category not found in QBO accounts"
+
+---
+
+## EXAMPLES
+
+### Example 1: Perfect Match
+
+Input:
+- Expense: $52.96, "Shell Gas Station", 2024-12-06, "Fuel - COS", "California"
+- Receipt: Shows $52.96, "Shell", "12/06/2024"
+- Bank transactions: [{id: "abc-123", amount: 52.96, date: "2024-12-06", description: "SHELL GAS STATION CA"}]
+
+Output:
 ```json
 {
-    "type": "n8n-nodes-base.supabase",
-    "parameters": {
-        "operation": "getAll",
-        "tableId": "bank_transactions",
-        "filters": {
-            "conditions": [
-                {
-                    "keyName": "status",
-                    "condition": "eq",
-                    "keyValue": "unmatched"
-                },
-                {
-                    "keyName": "transaction_date",
-                    "condition": "lt",
-                    "keyValue": "={{ DateTime.now().minus({days: 5}).toISODate() }}"
-                }
-            ]
-        }
-    }
+  "matched_bank_txn_id": "abc-123",
+  "match_confidence": 100,
+  "qbo_account_id": "35",
+  "qbo_class_id": "1000000004",
+  "state_code": "CA",
+  "flag_reason": null,
+  "receipt_amount_matches": true,
+  "receipt_merchant_matches": true
 }
 ```
 
-#### Node B3: State Determination Waterfall (Code Node)
+### Example 2: No Bank Match
 
-```javascript
-const transaction = $json;
-const vendorRules = $('Fetch Vendor Rules').all().map(item => item.json);
-const mondayEvents = $('Fetch Monday Events').all().map(item => item.json);
+Input:
+- Expense: $45.00, "Amazon", 2024-12-06, "Office Supplies", "Other"
+- Receipt: Shows $45.00, "Amazon.com"
+- Bank transactions: [] (empty - no matches in date range)
 
-// Parse common vendor patterns from description
-const description = transaction.description.toUpperCase();
-
-// Step 1: Check vendor_rules for matching pattern
-let matchedRule = null;
-for (const rule of vendorRules) {
-    const pattern = rule.vendor_pattern.toUpperCase();
-    if (description.includes(pattern)) {
-        matchedRule = rule;
-        break;
-    }
-}
-
-if (matchedRule && matchedRule.default_state) {
-    return {
-        json: {
-            ...transaction,
-            determined_state: matchedRule.default_state,
-            determined_category: matchedRule.default_category,
-            determination_method: 'vendor_rules',
-            matched_vendor_rule_id: matchedRule.id,
-            needs_review: false
-        }
-    };
-}
-
-// Step 2: Parse description for city/state patterns
-// Common patterns: "CITY STATE", "CITY, STATE", "CITY ST"
-const statePatterns = [
-    { code: 'CA', patterns: ['CALIFORNIA', ' CA ', ' CA$', ',CA'] },
-    { code: 'TX', patterns: ['TEXAS', ' TX ', ' TX$', ',TX'] },
-    { code: 'CO', patterns: ['COLORADO', ' CO ', ' CO$', ',CO'] },
-    { code: 'WA', patterns: ['WASHINGTON', ' WA ', ' WA$', ',WA'] },
-    { code: 'NJ', patterns: ['NEW JERSEY', ' NJ ', ' NJ$', ',NJ'] },
-    { code: 'FL', patterns: ['FLORIDA', ' FL ', ' FL$', ',FL'] },
-    { code: 'MT', patterns: ['MONTANA', ' MT ', ' MT$', ',MT'] },
-    { code: 'PA', patterns: ['PENNSYLVANIA', ' PA ', ' PA$', ',PA'] },
-    { code: 'NY', patterns: ['NEW YORK', ' NY ', ' NY$', ',NY'] },
-    { code: 'AZ', patterns: ['ARIZONA', ' AZ ', ' AZ$', ',AZ'] },
-    { code: 'NV', patterns: ['NEVADA', ' NV ', ' NV$', ',NV'] },
-    { code: 'OR', patterns: ['OREGON', ' OR ', ' OR$', ',OR'] }
-];
-
-let parsedState = null;
-for (const state of statePatterns) {
-    for (const pattern of state.patterns) {
-        if (description.includes(pattern) || description.match(new RegExp(pattern))) {
-            parsedState = state.code;
-            break;
-        }
-    }
-    if (parsedState) break;
-}
-
-if (parsedState) {
-    return {
-        json: {
-            ...transaction,
-            determined_state: parsedState,
-            determined_category: matchedRule?.default_category || null,
-            determination_method: 'description_parsing',
-            needs_review: matchedRule?.default_category ? false : true
-        }
-    };
-}
-
-// Step 3: Date proximity to course
-const txnDate = new Date(transaction.transaction_date);
-for (const event of mondayEvents) {
-    const eventStart = new Date(event.start_date);
-    const eventEnd = new Date(event.end_date || event.start_date);
-
-    // Expand window by 2 days on each side
-    eventStart.setDate(eventStart.getDate() - 2);
-    eventEnd.setDate(eventEnd.getDate() + 2);
-
-    if (txnDate >= eventStart && txnDate <= eventEnd) {
-        return {
-            json: {
-                ...transaction,
-                determined_state: event.state,
-                determined_category: null, // Still need category
-                determination_method: 'course_proximity',
-                matched_monday_event_id: event.monday_item_id,
-                matched_event_name: event.event_name,
-                needs_review: true // Need human to confirm category
-            }
-        };
-    }
-}
-
-// Step 4: Cannot determine - queue for review
-return {
-    json: {
-        ...transaction,
-        determined_state: null,
-        determined_category: null,
-        determination_method: 'none',
-        needs_review: true
-    }
-};
-```
-
-### Reimbursement Handling in Flow A
-
-When Flow A (Zoho Expense Processing) finds NO matching bank transaction:
-
-```javascript
-// In AI Agent decision logic
-if (!bankMatchFound) {
-    // This is a reimbursement - employee used personal card
-    queue_for_review({
-        zoho_expense_id: expense.expense_id,
-        is_reimbursement: true,
-        flag_reason: 'No bank match - appears to be reimbursable expense',
-        // ... other fields
-    });
+Output:
+```json
+{
+  "matched_bank_txn_id": null,
+  "match_confidence": 60,
+  "qbo_account_id": "12",
+  "qbo_class_id": "1000000012",
+  "state_code": "NC",
+  "flag_reason": "No bank match found - may be reimbursement",
+  "receipt_amount_matches": true,
+  "receipt_merchant_matches": true
 }
 ```
 
-The expense_queue entry will have:
-- `is_reimbursement: true`
-- `flag_reason: "No bank match - reimbursable expense"`
-- `suggested_bank_txn_id: null`
+---
 
-Human reviewer will:
-1. Confirm it's a valid expense
-2. Approve for posting to QBO (without bank match)
-3. Mark reimbursement method (check, zelle, payroll deduction)
+## FINAL NOTES
+
+- You do NOT call any tools
+- Your output JSON will be used by subsequent n8n nodes
+- Focus on accuracy - it's OK to flag for human review if uncertain
+- ALWAYS provide a flag_reason if confidence < 95%
+```
+
+---
+
+## Queue Recovery Procedures
+
+### Stuck Expenses (status = 'processing' for >15 minutes)
+
+**Symptoms:**
+- Expenses stuck in 'processing' status
+- No new expenses being picked up by queue controller
+- n8n workflow failed/timed out without updating status
+
+**Diagnosis:**
+```sql
+-- Find stuck expenses
+SELECT
+  id,
+  zoho_expense_id,
+  merchant_name,
+  amount,
+  processing_started_at,
+  processing_attempts,
+  EXTRACT(EPOCH FROM (NOW() - processing_started_at))/60 AS minutes_stuck
+FROM zoho_expenses
+WHERE status = 'processing'
+  AND processing_started_at < NOW() - INTERVAL '15 minutes'
+ORDER BY processing_started_at;
+```
+
+**Resolution:**
+```sql
+-- Reset stuck expenses to pending for reprocessing
+UPDATE zoho_expenses
+SET
+  status = 'pending',
+  last_error = 'Reset: stuck in processing after timeout',
+  processing_attempts = processing_attempts + 1
+WHERE status = 'processing'
+  AND processing_started_at < NOW() - INTERVAL '15 minutes';
+
+-- This UPDATE triggers queue controller to pick them up again
+```
+
+### Failed Expenses (status = 'error')
+
+**Symptoms:**
+- Expenses in 'error' status
+- Teams notification received with error details
+
+**Diagnosis:**
+```sql
+-- View failed expenses with error messages
+SELECT
+  id,
+  zoho_expense_id,
+  merchant_name,
+  amount,
+  status,
+  last_error,
+  processing_attempts,
+  processed_at
+FROM zoho_expenses
+WHERE status = 'error'
+ORDER BY processed_at DESC
+LIMIT 20;
+```
+
+**Resolution:**
+
+1. **Investigate error cause** (check last_error field)
+2. **Fix root cause** (e.g., QBO auth expired, missing vendor_rules pattern)
+3. **Reset for retry:**
+
+```sql
+-- Reset specific expense for retry
+UPDATE zoho_expenses
+SET
+  status = 'pending',
+  last_error = NULL
+WHERE id = '550e8400-e29b-41d4-a716-446655440000';
+
+-- Or reset ALL failed expenses (use cautiously)
+UPDATE zoho_expenses
+SET
+  status = 'pending',
+  last_error = 'Bulk reset after root cause fix'
+WHERE status = 'error'
+  AND processing_attempts < 3;  -- Prevent infinite retry loop
+```
+
+### Manual Queue Trigger
+
+**Symptoms:**
+- Queue seems stuck (no pending expenses being claimed)
+- Trigger function not firing
+
+**Resolution:**
+```sql
+-- Manually trigger queue processing
+-- This forces the trigger function to run
+SELECT process_expense_queue() FROM zoho_expenses LIMIT 1;
+
+-- Or directly call via pg_net (simulates trigger)
+SELECT net.http_post(
+  url := 'https://as3driving.app.n8n.cloud/webhook/process-expense',
+  headers := '{"Content-Type": "application/json"}',
+  body := json_build_object('expense_id', id)::text
+)
+FROM zoho_expenses
+WHERE status = 'pending'
+LIMIT 1;
+```
+
+### Monitor Queue Health
+
+**Create this monitoring query:**
+```sql
+-- Queue health dashboard
+SELECT
+  status,
+  COUNT(*) as count,
+  MIN(created_at) as oldest,
+  MAX(created_at) as newest,
+  AVG(processing_attempts) as avg_attempts
+FROM zoho_expenses
+WHERE created_at > NOW() - INTERVAL '7 days'
+GROUP BY status
+ORDER BY
+  CASE status
+    WHEN 'processing' THEN 1
+    WHEN 'pending' THEN 2
+    WHEN 'error' THEN 3
+    WHEN 'flagged' THEN 4
+    WHEN 'posted' THEN 5
+  END;
+```
+
+**Expected healthy state:**
+- `processing`: 0-5 (active executions)
+- `pending`: 0 (all processed)
+- `error`: 0-2 (investigate if >2)
+- `flagged`: varies (human review needed)
+- `posted`: majority
 
 ---
 
 ## Error Handling
 
+### Global Error Strategy
+
+All nodes in the workflow should connect to a global error handler that:
+
+1. **Updates expense status to 'error'**
+2. **Logs error details to last_error field**
+3. **Increments processing_attempts counter**
+4. **Sends Teams notification** (if attempts >= 3)
+
+### Error Handler Node
+
+**Type:** `n8n-nodes-base.supabase` (on error trigger)
+
+```json
+{
+  "operation": "update",
+  "tableId": "zoho_expenses",
+  "filterType": "id",
+  "id": "={{ $json.expense_id }}",
+  "fieldsUi": {
+    "fieldValues": [
+      { "fieldId": "status", "fieldValue": "error" },
+      { "fieldId": "last_error", "fieldValue": "={{ $json.error.message }}" },
+      { "fieldId": "processing_attempts", "fieldValue": "={{ $json.processing_attempts + 1 }}" },
+      { "fieldId": "processed_at", "fieldValue": "={{ $now.toISO() }}" }
+    ]
+  }
+}
+```
+
 ### Retry Strategy
 
 | Error Type | Retry? | Action |
 |------------|--------|--------|
-| Supabase connection | Yes, 3x | Exponential backoff (1s, 2s, 4s) |
-| QBO API rate limit | Yes, 3x | Wait 30 seconds between retries |
-| QBO OAuth expired | No | Trigger OAuth refresh, retry once |
-| Receipt fetch failed | No | Continue without receipt, reduce confidence |
-| AI iteration limit | No | Log error, queue all remaining for manual review |
+| Supabase connection timeout | Yes (automatic by queue) | Status reset to 'pending' after 5 min |
+| QBO API rate limit (429) | Yes (automatic by queue) | Status reset after 1 min |
+| QBO OAuth expired | No | Manual OAuth refresh required |
+| Receipt not found in Storage | No | Flag for review (missing receipt) |
+| AI iteration limit | No | Flag for review (too complex) |
+| Invalid expense data | No | Mark as 'error' (fix data, reset manually) |
 
-### Error Logging
+### Teams Notification
 
-Create an `error_log` table or use n8n's built-in error workflow:
+**Trigger:** When `processing_attempts >= 3` OR critical errors
 
-```sql
-CREATE TABLE IF NOT EXISTS workflow_errors (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    workflow_id TEXT,
-    execution_id TEXT,
-    node_name TEXT,
-    error_type TEXT,
-    error_message TEXT,
-    expense_id TEXT,
-    input_data JSONB,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
+**Webhook URL:** `https://as3drivertraining.webhook.office.com/webhookb2/...`
+
+**Message Format:**
+```json
+{
+  "@type": "MessageCard",
+  "@context": "https://schema.org/extensions",
+  "summary": "Expense Processing Failed",
+  "themeColor": "FF0000",
+  "title": "Expense Processing Error",
+  "sections": [{
+    "activityTitle": "Expense {{ $json.zoho_expense_id }} failed after 3 attempts",
+    "facts": [
+      { "name": "Merchant", "value": "{{ $json.merchant_name }}" },
+      { "name": "Amount", "value": "${{ $json.amount }}" },
+      { "name": "Date", "value": "{{ $json.expense_date }}" },
+      { "name": "Error", "value": "{{ $json.last_error }}" },
+      { "name": "Attempts", "value": "{{ $json.processing_attempts }}" }
+    ],
+    "markdown": true
+  }],
+  "potentialAction": [{
+    "@type": "OpenUri",
+    "name": "View in Dashboard",
+    "targets": [{
+      "os": "default",
+      "uri": "https://expenses.as3drivertraining.com/queue"
+    }]
+  }]
+}
 ```
 
 ---
@@ -1006,100 +1470,159 @@ CREATE TABLE IF NOT EXISTS workflow_errors (
 
 | Test Case | Input | Expected Output |
 |-----------|-------|-----------------|
-| Happy path - COS expense | COS report, matching bank txn | Posted to QBO |
-| Happy path - Non-COS | Admin report, matching bank txn | Posted to QBO |
-| No bank match | Expense without matching bank txn | Queued for review |
-| Receipt mismatch | Receipt shows different amount | Queued for review |
-| Duplicate expense | Same zoho_expense_id twice | Skip second attempt |
-| Category mismatch | COS report with Non-COS category | Flagged with warning |
+| **Happy path - COS** | Valid COS expense with bank match | Status: 'posted', QBO Purchase created, receipt attached |
+| **Happy path - Non-COS** | Valid admin expense with bank match | Status: 'posted', QBO Purchase created |
+| **No bank match** | Expense without matching bank txn | Status: 'flagged', expense_queue entry created |
+| **Low confidence** | Receipt amount mismatch | Status: 'flagged', confidence < 95% |
+| **Duplicate processing** | Resubmit same expense_id | Exit early (status != 'processing') |
+| **Missing receipt** | Receipt not in Storage | Continue with confidence penalty |
+| **QBO error** | QBO API returns 500 | Status: 'error', last_error populated |
+| **Large report** | 50 expenses in report | All 50 processed independently |
 
 ### Test Webhook Payload
 
-Use this sample to test the workflow:
+**Endpoint:** `POST https://as3driving.app.n8n.cloud/webhook/process-expense`
 
+**Payload:**
 ```json
 {
-    "body": {
-        "expense_report": {
-            "report_id": "TEST-001",
-            "report_name": "C24 - ACADS - CL - Dec 06-07",
-            "user_name": "Test User",
-            "start_date": "2024-12-06",
-            "end_date": "2024-12-07",
-            "expenses": [
-                {
-                    "expense_id": "TEST-EXP-001",
-                    "amount": 52.96,
-                    "merchant_name": "Test Gas Station",
-                    "date": "2024-12-06",
-                    "category_name": "Fuel - COS",
-                    "description": "Fuel for course vehicle",
-                    "paid_through_account_name": "AMEX Business 61002",
-                    "line_items": [{
-                        "tags": [{
-                            "tag_name": "Course Location",
-                            "tag_option_name": "California"
-                        }]
-                    }],
-                    "documents": [{
-                        "document_id": "DOC-001"
-                    }]
-                }
-            ]
-        }
-    }
+  "expense_id": "550e8400-e29b-41d4-a716-446655440000"
 }
+```
+
+**Prerequisites:**
+1. Expense must exist in `zoho_expenses` table with status='pending'
+2. Receipt must be uploaded to Supabase Storage
+3. Related bank transactions must exist (if testing match logic)
+
+### Load Testing
+
+**Scenario:** Process 100 expenses from a large report
+
+1. Upload 100 expenses via Supabase Edge Function
+2. Monitor queue progression:
+   ```sql
+   SELECT status, COUNT(*)
+   FROM zoho_expenses
+   WHERE created_at > NOW() - INTERVAL '1 hour'
+   GROUP BY status;
+   ```
+3. Verify max 5 concurrent executions (check n8n execution list)
+4. Confirm all expenses reach final state ('posted', 'error', or 'flagged')
+5. Check average processing time per expense (target: <30 seconds)
+
+### Validation Queries
+
+```sql
+-- Verify all expenses processed
+SELECT
+  COUNT(*) FILTER (WHERE status = 'posted') as posted,
+  COUNT(*) FILTER (WHERE status = 'error') as errors,
+  COUNT(*) FILTER (WHERE status = 'flagged') as flagged,
+  COUNT(*) FILTER (WHERE status = 'pending') as pending,
+  COUNT(*) FILTER (WHERE status = 'processing') as processing
+FROM zoho_expenses
+WHERE created_at > NOW() - INTERVAL '1 hour';
+
+-- Verify bank transactions matched
+SELECT
+  bt.id,
+  bt.description,
+  bt.amount,
+  bt.status,
+  ze.zoho_expense_id
+FROM bank_transactions bt
+LEFT JOIN zoho_expenses ze ON ze.bank_transaction_id = bt.id
+WHERE bt.transaction_date > NOW() - INTERVAL '1 week'
+ORDER BY bt.transaction_date DESC;
+
+-- Verify QBO Purchases created
+SELECT
+  ze.zoho_expense_id,
+  ze.merchant_name,
+  ze.amount,
+  ze.qbo_purchase_id,
+  bt.qbo_vendor_id
+FROM zoho_expenses ze
+JOIN bank_transactions bt ON bt.id = ze.bank_transaction_id
+WHERE ze.status = 'posted'
+  AND ze.qbo_posted_at > NOW() - INTERVAL '1 hour';
 ```
 
 ---
 
-## Workflow Backup & Deployment
+## Workflow Deployment
 
-### Export Current Workflow
+### Deployment Checklist
 
-1. Open n8n Cloud (as3driving.app.n8n.cloud)
-2. Navigate to workflow ZZPC3jm6mXbLrp3u
-3. Click menu → Download
-4. Save as `zoho-expense-processing-v1-backup.json`
+- [ ] Supabase Edge Function deployed (store_zoho_expenses)
+- [ ] Database trigger created (process_expense_queue)
+- [ ] `zoho_expenses` table created with correct schema
+- [ ] `qbo_classes` table populated with 8 states
+- [ ] n8n workflow rebuilt with queue-based architecture
+- [ ] Webhook endpoint updated in Zoho (points to Edge Function)
+- [ ] Test with single expense (manual trigger)
+- [ ] Test with 5 expenses (verify concurrency limit)
+- [ ] Test with 50+ expenses (load test)
+- [ ] Monitor first production report
+- [ ] Teams notification channel confirmed
+- [ ] Error recovery procedures documented
 
-### Deployment Steps
+### Rollback Plan
 
-1. Create new version of workflow (don't modify active)
-2. Implement changes node by node
-3. Test with webhook-test endpoint
-4. Verify with sample payloads
-5. Activate new version
-6. Monitor first 10 real executions
+If queue-based architecture fails:
+
+1. **Revert Zoho webhook** to old n8n endpoint (temporary)
+2. **Disable queue trigger** in Supabase:
+   ```sql
+   DROP TRIGGER IF EXISTS process_expense_trigger ON zoho_expenses;
+   ```
+3. **Investigate errors** in `zoho_expenses.last_error`
+4. **Fix and redeploy**
+5. **Re-enable trigger**
 
 ---
 
-## Monitoring
+## Monitoring & Metrics
 
-### Key Metrics
+### Key Metrics Dashboard
 
-| Metric | Target | Alert Threshold |
-|--------|--------|-----------------|
-| Iteration count | ≤ 4 | > 6 |
-| Execution time | < 30s | > 60s |
-| Success rate | > 95% | < 90% |
-| Auto-match rate | > 80% | < 60% |
+| Metric | Target | Alert Threshold | Query |
+|--------|--------|-----------------|-------|
+| Processing time per expense | <30s | >60s | Check n8n execution duration |
+| Success rate | >95% | <90% | `COUNT(*) WHERE status='posted' / COUNT(*)` |
+| Auto-match rate | >80% | <60% | `COUNT(*) WHERE match_confidence >= 95 / COUNT(*)` |
+| Flagged rate | <15% | >25% | `COUNT(*) WHERE status='flagged' / COUNT(*)` |
+| Error rate | <5% | >10% | `COUNT(*) WHERE status='error' / COUNT(*)` |
+| Queue depth | <10 | >50 | `COUNT(*) WHERE status='pending'` |
 
-### Dashboard Queries
+### Monitoring Queries
 
 ```sql
 -- Daily processing stats
 SELECT
-    DATE(created_at) as date,
-    COUNT(*) as total_processed,
-    SUM(CASE WHEN predicted_confidence >= 95 THEN 1 ELSE 0 END) as auto_approved,
-    SUM(CASE WHEN was_corrected THEN 1 ELSE 0 END) as corrections,
-    AVG(predicted_confidence) as avg_confidence
-FROM categorization_history
+  DATE(created_at) as date,
+  COUNT(*) as total_processed,
+  SUM(CASE WHEN status = 'posted' THEN 1 ELSE 0 END) as posted,
+  SUM(CASE WHEN status = 'flagged' THEN 1 ELSE 0 END) as flagged,
+  SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as errors,
+  ROUND(AVG(EXTRACT(EPOCH FROM (processed_at - created_at)))) as avg_seconds
+FROM zoho_expenses
 WHERE created_at >= CURRENT_DATE - INTERVAL '7 days'
 GROUP BY 1
 ORDER BY 1 DESC;
+
+-- Current queue state
+SELECT
+  status,
+  COUNT(*),
+  MIN(created_at) as oldest_created,
+  MAX(processing_started_at) as latest_processing_start
+FROM zoho_expenses
+WHERE created_at > NOW() - INTERVAL '24 hours'
+GROUP BY status;
 ```
 
 ---
 
-*End of n8n Workflow Specification*
+*End of n8n Workflow Specification v3.0*

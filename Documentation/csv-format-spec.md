@@ -1,8 +1,8 @@
 # AS3 Expense Automation - CSV Format Specification
 
-**Version:** 2.0
-**Last Updated:** December 6, 2025
-**Status:** Confirmed from sample files
+**Version:** 2.1
+**Last Updated:** December 7, 2025
+**Status:** Implemented and tested in web application
 
 ---
 
@@ -11,10 +11,11 @@
 1. [Overview](#overview)
 2. [Unified CSV Format](#unified-csv-format)
 3. [Column Specifications](#column-specifications)
-4. [Parsing Implementation](#parsing-implementation)
-5. [Source Detection](#source-detection)
-6. [State Extraction from Description](#state-extraction-from-description)
-7. [Duplicate Detection](#duplicate-detection)
+4. [Web Application Import Process](#web-application-import-process)
+5. [Parsing Implementation](#parsing-implementation)
+6. [Source Detection](#source-detection)
+7. [State Extraction from Description](#state-extraction-from-description)
+8. [Duplicate Detection](#duplicate-detection)
 
 ---
 
@@ -88,12 +89,160 @@ DATE,DESCRIPTION,From/To,SPENT,RECEIVED,ASSIGN TO
 ### RECEIVED
 
 - **Contains:** Income/deposits (Stripe transfers, refunds)
-- **Rule:** Skip rows where RECEIVED has a value (these are not expenses)
+- **Rule:** **Automatically skipped during import** - Rows where RECEIVED has a value are filtered out
+- **Purpose:** Separates income transactions from expenses; only expenses are imported
 
 ### From/To and ASSIGN TO
 
-- **Status:** **IGNORE COMPLETELY**
-- **Reason:** QBO's guesses, not authoritative. Our AI will categorize.
+- **Status:** **From/To is IGNORED** - QBO's guess, not authoritative
+- **ASSIGN TO:** Stored in preview for reference but not used for categorization decisions
+- **Reason:** Our AI and vendor rules provide more accurate categorization
+
+---
+
+## Web Application Import Process
+
+### Overview
+
+The AS3 Expense Dashboard web application provides a user-friendly CSV import process with:
+- **Case-insensitive header matching** (handles variations in CSV column names)
+- **Import preview** before committing transactions
+- **Automatic income filtering** (RECEIVED column rows are skipped)
+- **Duplicate detection** to prevent re-importing the same transactions
+- **Extended state detection** including international locations
+- **Comprehensive error handling** with row-level feedback
+
+### Import Flow
+
+1. **File Upload**
+   - Drag and drop CSV file or click to browse
+   - Accepts CSV files exported from QuickBooks Online
+
+2. **Parsing & Validation**
+   - Case-insensitive column header matching (DATE, date, Date all work)
+   - Automatic format detection (QBO export, AMEX direct, Wells Fargo direct)
+   - Row-by-row parsing with error tracking
+
+3. **Income Row Filtering**
+   - Rows where RECEIVED column has a value > 0 are **automatically skipped**
+   - These represent income/refunds, not expenses
+   - Skipped count is displayed in preview
+
+4. **Preview Display**
+   - Shows total transactions found
+   - Date range (earliest to latest)
+   - Number of transactions to import
+   - Number of rows skipped (with reasons: income, invalid date, no amount)
+   - Sample transactions table
+   - Parse errors with line numbers
+
+5. **Import Confirmation**
+   - User reviews preview data
+   - Clicks "Import X Transactions" to proceed
+   - Or cancels to try a different file
+
+6. **Database Import**
+   - Batch insert with duplicate detection
+   - Individual error tracking per transaction
+   - Success/duplicate/failed counts displayed
+
+### Case-Insensitive Header Matching
+
+The import process uses a helper function `getRowValue()` that matches column headers **regardless of case**:
+
+```typescript
+// All of these will match successfully:
+DATE, Date, date          → transaction_date
+DESCRIPTION, Description  → description
+SPENT, Spent, spent       → amount (expenses)
+RECEIVED, Received        → skipped if has value (income)
+ASSIGN TO, Assign To      → stored for reference only
+```
+
+This ensures compatibility with CSV exports from different sources that may use different capitalization.
+
+### Import Preview Example
+
+```
+Source: AMEX Business 61002 (auto-detected)
+Total rows in file: 50
+Transactions to import: 42
+
+Skipped rows:
+- Income/refunds (RECEIVED has value): 5
+- Invalid dates: 2
+- No valid amount: 1
+
+Date range: Nov 01, 2024 - Nov 30, 2024
+Total amount: $8,543.67
+
+Sample transactions:
+┌────────────┬──────────────────────────────────┬───────────┬──────────┐
+│ Date       │ Description                      │ Amount    │ State    │
+├────────────┼──────────────────────────────────┼───────────┼──────────┤
+│ Nov 30     │ SHELL OIL 12345 FRESNO CA       │ $45.67    │ CA       │
+│ Nov 29     │ MARRIOTT HOTELS DALLAS TX       │ $189.00   │ TX       │
+│ Nov 28     │ MICROSOFT*365 MSBILL.INFO WA    │ $31.50    │ Admin    │
+└────────────┴──────────────────────────────────┴───────────┴──────────┘
+
+Parse errors:
+- Row 15: Invalid date "Nov 32, 2024"
+- Row 23: Cannot parse date "TBD"
+
+[Cancel] [Import 42 Transactions]
+```
+
+### Error Handling
+
+The import process tracks errors at multiple levels:
+
+**Parse Errors** (row-level):
+- Invalid date formats
+- Missing required fields (date, amount, description)
+- Invalid amount values
+
+**Business Rule Filtering**:
+- Income rows (RECEIVED > 0) - automatically skipped, not errors
+- Rows with no expense amount - skipped with count
+
+**Database Errors**:
+- Duplicate transactions (based on composite key)
+- Constraint violations
+- Each error is captured with context
+
+### Extended Features
+
+**Date Parsing** - Handles multiple formats:
+- MM/DD/YYYY (QBO standard)
+- M/D/YYYY (single-digit month/day)
+- YYYY-MM-DD (ISO format)
+- Native JavaScript Date parsing as fallback
+
+**State Extraction** - Extended state list:
+- Core AS3 states: CA, TX, CO, WA, NJ, FL, MT
+- Additional states: OK, PA, IL, IN, VA, NC, DE, AZ, NV
+- International detection: GB, GBR, SG, ME → marked as "INTL"
+
+**Vendor Extraction**:
+- Removes card identifiers (XXXX1234, CARD 6323)
+- Strips special characters
+- Extracts first 2-3 meaningful words
+- Used for matching against vendor rules
+
+### Success Response
+
+After successful import:
+
+```
+Import complete!
+
+Successfully imported: 40 transactions
+Duplicates skipped: 2
+Failed: 0
+
+Date range: Nov 01 - Nov 30, 2024
+Account: AMEX Business 61002
+```
 
 ---
 
@@ -277,7 +426,8 @@ const US_STATES = [
 ];
 
 // AS3 operating states (for priority matching)
-const AS3_STATES = ['CA', 'TX', 'CO', 'WA', 'NJ', 'FL', 'MT'];
+// Extended with commonly seen states in transaction data
+const AS3_STATES = ['CA', 'TX', 'CO', 'WA', 'NJ', 'FL', 'MT', 'OK', 'PA', 'IL', 'IN', 'VA', 'NC', 'DE', 'AZ', 'NV'];
 
 function extractState(description: string): string | null {
     const upper = description.toUpperCase();
@@ -299,12 +449,15 @@ function extractState(description: string): string | null {
         }
     }
 
-    // Pattern 3: International (GB, GBR = UK, etc.)
-    if (upper.includes(' GB ') || upper.includes(' GBR ')) {
+    // Pattern 3: International (GB, GBR = UK, SG = Singapore, ME = Mexico)
+    if (upper.includes(' GB ') || upper.includes(' GBR ') || upper.includes('UNITED KINGDOM')) {
         return 'INTL';
     }
-    if (upper.includes(' SG ')) {
-        return 'INTL'; // Singapore
+    if (upper.includes(' SG ') || upper.includes('SINGAPORE')) {
+        return 'INTL';
+    }
+    if (upper.includes(' ME ') || upper.includes('MEXICO')) {
+        return 'INTL';
     }
 
     return null;
@@ -412,8 +565,11 @@ function extractVendor(description: string): string | null {
     clean = clean.replace(/SXXXXXXXX\d+/g, '');
     clean = clean.replace(/CARD \d{4}/g, '');
 
-    // Remove state codes at end
+    // Remove trailing state codes (2-letter codes at end)
     clean = clean.replace(/\s+[A-Z]{2}\s*$/g, '');
+
+    // Clean up special characters but preserve spaces
+    clean = clean.replace(/[^A-Z0-9\s]/g, ' ');
 
     // Get first 2-3 meaningful words
     const words = clean.trim().split(/\s+/).filter(w => w.length > 1);

@@ -1,7 +1,7 @@
 # AS3 Expense Dashboard - User Guide
 
-**Version:** 1.0
-**Last Updated:** December 6, 2025
+**Version:** 1.1
+**Last Updated:** December 7, 2025
 **Audience:** AS3 Team Members (Pablo, Ashley, Team)
 
 ---
@@ -154,46 +154,82 @@ Import bank statements:
 ### How to Import
 
 1. Go to **Import** from the sidebar
-2. Download CSV from your bank:
-   - **AMEX:** Log in → Statements → Download CSV
-   - **Wells Fargo:** Log in → Account Activity → Export
+2. Download CSV from QuickBooks Online:
+   - **Banking** → Select account (AMEX or Wells Fargo)
+   - **Bank Transactions** → **Download CSV** (export format)
+   - Make sure to export from QBO, not directly from bank
 3. Drag and drop the CSV file onto the upload area
 4. Wait for parsing (takes a few seconds)
 
 ### Preview Screen
 
-After uploading, you'll see:
+After uploading, you'll see a detailed preview before importing:
 
 | Field | Description |
 |-------|-------------|
-| **Source** | AMEX or Wells Fargo (auto-detected) |
-| **Transactions** | Total number found |
+| **Source** | Bank account (auto-detected from file/content) |
+| **Total rows** | All rows found in CSV file |
+| **Transactions to import** | Valid expense transactions |
 | **Date Range** | Earliest to latest transaction date |
-| **Duplicates** | Already imported (will be skipped) |
-| **New** | New transactions to import |
+| **Skipped rows** | Breakdown of what was filtered out |
+
+### Skipped Rows Explained
+
+The import process automatically filters out non-expense transactions:
+
+- **Income/refunds** - Rows where RECEIVED column has a value (these are deposits, not expenses)
+- **Invalid dates** - Rows where the date couldn't be parsed
+- **No valid amount** - Rows without a valid expense amount
+
+This filtering happens **automatically** and is shown in the preview so you know what's being excluded.
 
 ### Transaction Preview Table
 
-Review the transactions before importing:
-- **New** - Will be imported
-- **Duplicate** - Already exists, will be skipped
-- Red highlight = potential issues (unusual amount, etc.)
+Review the parsed transactions before importing:
+- Shows sample transactions (date, description, amount, state)
+- Extracted state codes from descriptions (CA, TX, INTL, etc.)
+- Parse errors listed with row numbers for troubleshooting
+- **All income transactions are filtered out** - you only see expenses
 
 ### Confirming Import
 
-1. Review the preview
-2. Click **Import X Transactions**
-3. Wait for completion
-4. See success message with count
+1. Review the preview data
+2. Check skipped rows to ensure nothing unexpected was filtered
+3. Review any parse errors (shown with row numbers)
+4. Click **Import X Transactions** to proceed
+5. Wait for completion (usually a few seconds)
+6. See success message with detailed counts:
+   - Successfully imported
+   - Duplicates skipped (already in database)
+   - Failed (if any, with reasons)
 
 ### Troubleshooting Import
 
 | Issue | Solution |
 |-------|----------|
-| "Unknown format" | Wrong file type - ensure it's a CSV |
-| "No transactions found" | Empty file or wrong date range |
-| "All duplicates" | Already imported this statement |
-| Parse errors | Check file isn't corrupted |
+| "Unknown format" | Wrong file type - ensure it's a CSV from QBO export |
+| "No valid transactions found" | Check skipped rows - might all be income, or dates invalid |
+| "All duplicates" | Already imported this statement - check date range |
+| Parse errors shown | Review error messages - usually date format issues on specific rows |
+| "Wrong account detected" | Rename file to include bank name (e.g., "AMEX_Nov2024.csv") |
+| All rows skipped as income | Verify you exported expenses, not income transactions |
+
+### Common Import Questions
+
+**Q: Why were some rows skipped?**
+A: The import automatically filters:
+- Income transactions (RECEIVED column has a value) - these are deposits, not expenses
+- Rows with invalid dates or amounts
+- The preview shows exactly what was skipped and why
+
+**Q: What if I see parse errors?**
+A: Review the error messages - they show the row number and issue. Common causes:
+- Invalid date formats (CSV might have corrupt data on those rows)
+- Missing required fields
+- You can still import the valid transactions; only error rows are skipped
+
+**Q: Does the import handle duplicates?**
+A: Yes, automatically. If you import the same CSV twice, duplicate transactions are detected and skipped. The success message shows how many duplicates were found.
 
 ---
 
@@ -389,6 +425,7 @@ A: For expenses that don't have a specific state (e.g., online purchases, subscr
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.1 | Dec 7, 2025 | Updated CSV import documentation with preview details and income filtering |
 | 1.0 | Dec 6, 2025 | Initial release |
 
 ---

@@ -1,7 +1,7 @@
 # AS3 Expense Automation - Web Application Specification
 
-**Version:** 1.0
-**Last Updated:** December 6, 2025
+**Version:** 1.2
+**Last Updated:** December 15, 2025
 **Technology Stack:** React 18 + Vite + Tailwind CSS + Supabase
 
 ---
@@ -209,11 +209,13 @@ const routes = [
 
 ### Three Distinct Review Queues
 
-| Queue | Route | Purpose |
-|-------|-------|---------|
-| **Review Queue** | `/review` | Zoho expenses matched to bank but flagged for low confidence |
-| **Orphan Queue** | `/orphans` | Bank transactions with no Zoho expense after 5 days |
-| **Reimbursement Queue** | `/reimbursements` | Zoho expenses with no bank match (personal card) |
+| Queue | Route | Purpose | Data Source |
+|-------|-------|---------|-------------|
+| **Review Queue** | `/review` | Zoho expenses flagged during queue processing | `zoho_expenses` (status='flagged') + legacy `expense_queue` |
+| **Orphan Queue** | `/orphans` | Bank transactions with no Zoho expense after 5 days | `bank_transactions` (status='unmatched') |
+| **Reimbursement Queue** | `/reimbursements` | Zoho expenses with no bank match (personal card) | `expense_queue` (is_reimbursement=true) |
+
+**Note:** As of December 2025, the Review Queue fetches from **both** the new `zoho_expenses` table (queue-based architecture v3.0) and the legacy `expense_queue` table. The `zoho_expenses` table is the primary source for new expenses processed via the queue controller.
 
 ### Page Specifications
 
@@ -318,6 +320,29 @@ const routes = [
 - **Approve:** Update expense_queue.status → 'approved', trigger QBO posting
 - **Correct:** Update expense_queue with corrections, status → 'corrected'
 - **Reject:** Update expense_queue.status → 'rejected'
+
+**zoho_expenses Items (Queue-Based Architecture v3.0):**
+
+For items from the `zoho_expenses` table (flagged during queue processing):
+
+- **Match Confidence Display:** Visual progress bar showing confidence percentage (green ≥95%, amber ≥70%, red <70%)
+- **Processing Attempts:** Counter shown when item has been retried more than once
+- **Available Actions:**
+  - **Approve:** If no changes needed, mark as approved (status → 'posted')
+  - **Save & Resubmit:** Apply corrections (state_tag, category_name) and reset status → 'pending' for reprocessing
+  - **Resubmit:** Reset status → 'pending' without changes to retry processing
+  - **Reject:** Mark as rejected (status → 'rejected')
+  - **Create Vendor Rule:** Optionally create vendor rule from corrections
+
+**Receipt Display:** Receipts stored in Supabase Storage bucket `expense-receipts` are displayed via signed URLs (1-hour expiry).
+
+**Resubmit Flow:**
+1. User corrects state/category in UI
+2. Clicks "Save & Resubmit"
+3. Updates zoho_expenses row with corrections
+4. Resets status to 'pending', clears processing_started_at and last_error
+5. Queue controller picks up expense for reprocessing
+6. n8n applies corrected values during processing
 
 ---
 
@@ -448,7 +473,7 @@ const routes = [
 
 #### Bank Import (`/import`)
 
-**Purpose:** Upload AMEX/Wells Fargo CSV statements
+**Purpose:** Upload bank transaction CSV files exported from QuickBooks Online
 
 **Layout:**
 ```
@@ -463,7 +488,7 @@ const routes = [
 │ │     │    Drag & drop CSV file here             │       │ │
 │ │     │         or click to browse               │       │ │
 │ │     │                                           │       │ │
-│ │     │    Supports: AMEX, Wells Fargo           │       │ │
+│ │     │    QuickBooks Online CSV Export          │       │ │
 │ │     │                                           │       │ │
 │ │     └───────────────────────────────────────────┘       │ │
 │ │                                                         │ │
@@ -471,29 +496,50 @@ const routes = [
 │                                                             │
 │ PREVIEW (after file upload):                                │
 │ ┌─────────────────────────────────────────────────────────┐ │
-│ │ Source: AMEX Business 61002                              │ │
-│ │ Transactions: 47                                         │ │
-│ │ Date Range: Nov 01, 2024 - Nov 30, 2024                  │ │
-│ │ Duplicates to skip: 12                                   │ │
-│ │ New to import: 35                                        │ │
+│ │ Source: AMEX Business 61002 (auto-detected)              │ │
+│ │ Total rows in file: 50                                   │ │
+│ │ Transactions to import: 42                               │ │
 │ │                                                         │ │
-│ │ Date       | Description          | Amount    | Status  │ │
-│ │ Nov 30     | SHELL OIL #123       | $45.67    | New     │ │
-│ │ Nov 29     | MARRIOTT HOTELS      | $189.00   | New     │ │
-│ │ Nov 28     | OFFICE DEPOT         | $34.99    | Dup     │ │
+│ │ Skipped rows:                                            │ │
+│ │ - Income/refunds (RECEIVED has value): 5                 │ │
+│ │ - Invalid dates: 2                                       │ │
+│ │ - No valid amount: 1                                     │ │
+│ │                                                         │ │
+│ │ Date Range: Nov 01, 2024 - Nov 30, 2024                  │ │
+│ │ Total amount: $8,543.67                                  │ │
+│ │                                                         │ │
+│ │ Sample transactions:                                     │ │
+│ │ Date    | Description           | Amount  | State       │ │
+│ │ Nov 30  | SHELL OIL FRESNO CA  | $45.67  | CA          │ │
+│ │ Nov 29  | MARRIOTT DALLAS TX   | $189.00 | TX          │ │
+│ │ Nov 28  | MICROSOFT*365 WA     | $31.50  | Admin       │ │
 │ │ ...                                                     │ │
 │ │                                                         │ │
-│ │ [Cancel] [Import 35 Transactions]                        │ │
+│ │ Parse errors:                                            │ │
+│ │ - Row 15: Invalid date "Nov 32, 2024"                    │ │
+│ │ - Row 23: Cannot parse date "TBD"                        │ │
+│ │                                                         │ │
+│ │ [Cancel] [Import 42 Transactions]                        │ │
 │ └─────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 **Data Flow:**
-1. User drops CSV file
-2. Parse CSV, detect format (AMEX vs Wells Fargo)
-3. Query existing bank_transactions for duplicates
-4. Show preview with new/duplicate counts
-5. On confirm, batch insert new transactions
+1. User selects bank account from dropdown (AMEX, Wells Fargo, etc.)
+2. User drops CSV file
+3. Parse CSV with case-insensitive header matching
+4. Auto-detect CSV format from headers (QBO export format)
+5. Filter out income rows (RECEIVED column has value)
+6. Parse dates, amounts, extract vendors from descriptions
+7. Show detailed preview with:
+   - Valid transactions to import
+   - Skipped rows breakdown
+   - Parse errors with row numbers
+   - Sample transactions
+8. On confirm, batch insert with duplicate detection
+9. Show result summary (success/duplicate/failed counts)
+
+**Note:** The CSV format is auto-detected from column headers. There is no manual format selection dropdown - the parser intelligently identifies the format.
 
 ---
 

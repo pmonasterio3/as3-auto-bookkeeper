@@ -1,0 +1,101 @@
+@import "tailwindcss";
+
+/* Animations for Sheet/Dialog components */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes fadeOut {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+@keyframes slideInFromRight {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+@keyframes slideOutToRight {
+  from { transform: translateX(0); }
+  to { transform: translateX(100%); }
+}
+
+@keyframes slideInFromLeft {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(0); }
+}
+
+@keyframes slideOutToLeft {
+  from { transform: translateX(0); }
+  to { transform: translateX(-100%); }
+}
+
+/* Radix UI state-based animations */
+[data-state="open"] .animate-in { animation: fadeIn 200ms ease-out; }
+[data-state="closed"] .animate-out { animation: fadeOut 150ms ease-in; }
+
+.slide-in-from-right { animation: slideInFromRight 300ms ease-out; }
+.slide-out-to-right { animation: slideOutToRight 200ms ease-in; }
+.slide-in-from-left { animation: slideInFromLeft 300ms ease-out; }
+.slide-out-to-left { animation: slideOutToLeft 200ms ease-in; }
+
+/* AS3 Driver Training Brand Colors */
+:root {
+  /* Primary brand colors */
+  --as3-red: #C10230;
+  --as3-red-dark: #9e0228;
+  --as3-orange: #FF9F1C;
+  --as3-orange-dark: #e68a00;
+  --as3-teal: #119DA4;
+  --as3-teal-dark: #0d7a80;
+
+  /* Semantic colors */
+  --color-primary: #C10230;
+  --color-primary-dark: #9e0228;
+  --color-secondary: #FF9F1C;
+  --color-secondary-dark: #e68a00;
+  --color-accent: #119DA4;
+  --color-success: #22C55E;
+  --color-warning: #F59E0B;
+  --color-error: #EF4444;
+  --color-info: #3B82F6;
+
+  /* UI colors */
+  --color-background: #f8fafc;
+  --color-surface: #ffffff;
+  --color-text: #1e293b;
+  --color-text-muted: #64748b;
+
+  /* Brand gradients */
+  --gradient-primary: linear-gradient(to right, #C10230, #FF9F1C);
+  --gradient-subtle: linear-gradient(to bottom right, rgba(193, 2, 48, 0.1), rgba(255, 159, 28, 0.1));
+}
+
+/* Base styles */
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background-color: var(--color-background);
+  color: var(--color-text);
+  margin: 0;
+  min-height: 100vh;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}

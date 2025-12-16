@@ -1,7 +1,7 @@
 # AS3 Expense Automation - Database Schema
 
-**Version:** 1.0
-**Last Updated:** December 6, 2025
+**Version:** 2.2
+**Last Updated:** December 16, 2025
 **Database:** Supabase (PostgreSQL)
 
 ---
@@ -11,11 +11,13 @@
 1. [Overview](#overview)
 2. [Existing Tables](#existing-tables)
 3. [New Tables](#new-tables)
-4. [Indexes](#indexes)
-5. [Row Level Security](#row-level-security)
-6. [Triggers & Functions](#triggers--functions)
-7. [Views](#views)
-8. [Migration Script](#migration-script)
+4. [pg_net Extension](#pg_net-extension)
+5. [Queue Controller Function and Triggers](#queue-controller-function-and-triggers)
+6. [Indexes](#indexes)
+7. [Row Level Security](#row-level-security)
+8. [Triggers & Functions](#triggers--functions)
+9. [Views](#views)
+10. [Migration Script](#migration-script)
 
 ---
 
@@ -24,26 +26,44 @@
 The AS3 Expense Automation system uses Supabase (PostgreSQL) as its primary data store. This document describes:
 
 - **Existing tables** that must be preserved (categorization_history, vendor_rules, flagged_expenses, qbo_accounts)
-- **New tables** to be created (bank_transactions, expense_queue, monday_events)
+- **New tables** to be created (bank_transactions, expense_queue, zoho_expenses)
 - **Relationships** between tables
 - **Security policies** for Row Level Security (RLS)
+- **Queue controller** that manages concurrent expense processing
 
 ### Entity Relationship Diagram
 
 ```
 ┌─────────────────────┐       ┌─────────────────────┐
-│  bank_transactions  │       │   expense_queue     │
+│  zoho_expenses      │       │  bank_transactions  │
 ├─────────────────────┤       ├─────────────────────┤
-│ id (PK)             │───┐   │ id (PK)             │
-│ source              │   │   │ zoho_expense_id     │
-│ transaction_date    │   │   │ status              │
-│ amount              │   │   │ vendor_name         │
-│ description         │   └──>│ suggested_bank_txn_id│
-│ status              │       │ confidence_score    │
-│ matched_expense_id  │──────>│ corrections (JSONB) │
-│ qbo_purchase_id     │       └─────────────────────┘
-│ monday_subitem_id   │               │
+│ id (PK)             │       │ id (PK)             │
+│ zoho_expense_id     │       │ source              │
+│ status (queue)      │       │ transaction_date    │
+│ expense_date        │       │ amount              │
+│ amount              │       │ description         │
+│ merchant_name       │       │ status              │
+│ state_tag           │       │ matched_expense_id  │
+│ bank_transaction_id │──────>│ qbo_purchase_id     │
+│ qbo_purchase_id     │       │ monday_subitem_id   │
+│ match_confidence    │       └─────────────────────┘
+│ receipt_storage_path│               │
 └─────────────────────┘               │
+         │                            │
+         │ (processed by              │
+         │  n8n via queue)            │
+         │                            v
+         │               ┌─────────────────────────┐
+         │               │   expense_queue         │
+         │               ├─────────────────────────┤
+         │               │ id (PK)                 │
+         │               │ zoho_expense_id         │
+         │               │ status                  │
+         │               │ vendor_name             │
+         │               │ suggested_bank_txn_id   │
+         │               │ confidence_score        │
+         │               │ corrections (JSONB)     │
+         │               └─────────────────────────┘
          │                            │
          │                            v
          │               ┌─────────────────────────┐
@@ -80,6 +100,9 @@ The AS3 Expense Automation system uses Supabase (PostgreSQL) as its primary data
 │ is_cogs             │       │ start_date          │
 │ zoho_category_match │       │ end_date            │
 └─────────────────────┘       └─────────────────────┘
+                              (NOT CURRENTLY USED -
+                               n8n queries Monday API
+                               directly via GraphQL)
 ```
 
 ---
@@ -383,9 +406,106 @@ CREATE INDEX idx_expense_queue_reimbursement ON expense_queue(is_reimbursement) 
 
 ---
 
+### zoho_expenses
+
+**Purpose:** Queue-based expense ingestion table. Receives expenses directly from Zoho via Edge Function, processed one-by-one by n8n via queue controller.
+
+```sql
+-- Queue-based expense ingestion table
+-- Receives expenses directly from Zoho via Edge Function
+-- Processed one-by-one by n8n via queue controller
+CREATE TABLE zoho_expenses (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    -- Zoho identifiers
+    zoho_expense_id TEXT UNIQUE NOT NULL,  -- Unique expense ID from Zoho
+    zoho_report_id TEXT NOT NULL,          -- Parent report ID
+    zoho_report_name TEXT,                 -- Report name for reference
+
+    -- Raw payload (for re-processing if needed)
+    raw_payload JSONB NOT NULL,            -- Full expense JSON from Zoho
+
+    -- Extracted expense details (denormalized for fast queries)
+    expense_date DATE NOT NULL,
+    amount DECIMAL(10,2) NOT NULL,
+    merchant_name TEXT,
+    category_name TEXT,                    -- Zoho category (maps to QBO account)
+    state_tag TEXT,                        -- "Course Location" tag from Zoho
+    paid_through TEXT,                     -- 'AMEX Business 61002' or 'Wells Fargo Debit'
+
+    -- Receipt storage (Supabase Storage)
+    receipt_storage_path TEXT,             -- Path in 'expense-receipts' bucket
+    receipt_content_type TEXT,             -- 'image/jpeg', 'application/pdf', etc.
+
+    -- Processing status (state machine)
+    status TEXT DEFAULT 'pending'
+        CHECK (status IN ('pending', 'processing', 'matched', 'posted', 'flagged', 'error')),
+    processing_attempts INT DEFAULT 0,      -- Retry counter
+    processing_started_at TIMESTAMPTZ,      -- When n8n started processing
+    last_error TEXT,                        -- Error message if failed
+    flag_reason TEXT,                       -- Why expense was flagged for review
+
+    -- Matching results (set by n8n after processing)
+    bank_transaction_id UUID REFERENCES bank_transactions(id),
+    match_confidence INT CHECK (match_confidence >= 0 AND match_confidence <= 100),
+
+    -- QBO posting results (set by n8n after QBO posting)
+    qbo_purchase_id TEXT,                  -- QuickBooks Purchase ID
+    qbo_posted_at TIMESTAMPTZ,             -- When posted to QBO
+
+    -- Metadata
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),  -- Updated by trigger on each modification
+    processed_at TIMESTAMPTZ               -- When processing completed (success or failure)
+);
+
+-- Indexes for queue operations
+CREATE INDEX idx_zoho_expenses_status ON zoho_expenses(status);
+CREATE INDEX idx_zoho_expenses_pending ON zoho_expenses(status, created_at)
+    WHERE status = 'pending';
+CREATE INDEX idx_zoho_expenses_processing ON zoho_expenses(status, processing_started_at)
+    WHERE status = 'processing';
+CREATE INDEX idx_zoho_expenses_bank_txn ON zoho_expenses(bank_transaction_id);
+CREATE INDEX idx_zoho_expenses_date ON zoho_expenses(expense_date);
+```
+
+**Status State Machine:**
+```
+pending → processing → posted (success)
+                    → flagged (needs human review)
+                    → error (failed, can retry)
+
+Transitions:
+- pending → processing: Queue controller claims expense
+- processing → posted: n8n successfully matched + posted to QBO
+- processing → flagged: Match confidence < 95% or needs human decision
+- processing → error: API failure, can reset to pending to retry
+- flagged → pending: User resubmits from Review Queue UI (with or without corrections)
+```
+
+**UI Integration (as of December 15, 2025):**
+
+Flagged expenses (status='flagged') are displayed in the Review Queue UI with:
+- Match confidence percentage with visual progress bar
+- Processing attempts counter (if > 1)
+- Receipt image from Supabase Storage (signed URLs)
+- Available actions: Approve, Save & Resubmit, Resubmit, Reject, Create Vendor Rule
+
+**Resubmit Flow:**
+1. User corrects state_tag and/or category_name in UI
+2. Clicks "Save & Resubmit" (or "Resubmit" without changes)
+3. Updates row with corrections
+4. Resets status='pending', clears processing_started_at and last_error
+5. Queue controller picks up expense for reprocessing
+6. n8n applies corrected values during next processing attempt
+
+---
+
 ### monday_events
 
 **Purpose:** Local cache of Monday.com course events for fast lookup without API calls.
+
+**NOTE:** This table is NOT currently used in the system architecture. n8n queries Monday.com API directly via GraphQL. The table was created for potential future caching but is not part of the current implementation.
 
 ```sql
 CREATE TABLE monday_events (
@@ -447,6 +567,141 @@ CREATE INDEX idx_monday_events_board ON monday_events(board_id);
 
 ---
 
+## pg_net Extension
+
+The queue controller requires the `pg_net` extension to make asynchronous HTTP calls from PostgreSQL triggers.
+
+```sql
+-- Enable pg_net extension for async HTTP calls from triggers
+-- This extension is pre-installed on Supabase but needs to be enabled
+CREATE EXTENSION IF NOT EXISTS pg_net WITH SCHEMA extensions;
+
+-- Note: pg_net allows PostgreSQL triggers to make HTTP calls
+-- Used by queue controller to trigger n8n webhook
+-- Calls are async (fire-and-forget) - ideal for queue pattern
+```
+
+**Key Features:**
+- Pre-installed on Supabase (no additional setup required)
+- Async HTTP calls (non-blocking)
+- Fire-and-forget pattern (ideal for triggering n8n)
+- Runs in `extensions` schema (isolated from application tables)
+
+---
+
+## Queue Controller Function and Triggers
+
+The queue controller manages concurrent n8n expense processing with automatic load balancing.
+
+### Main Queue Controller Function
+
+```sql
+-- =============================================================================
+-- Queue Controller: Manages concurrent n8n expense processing
+-- =============================================================================
+
+-- Main queue controller function
+CREATE OR REPLACE FUNCTION process_expense_queue()
+RETURNS TRIGGER AS $$
+DECLARE
+    processing_count INT;
+    next_expense RECORD;
+    slots_available INT;
+    max_concurrent CONSTANT INT := 5;  -- Maximum concurrent n8n executions
+BEGIN
+    -- Only act on relevant events
+    IF TG_OP = 'UPDATE' THEN
+        -- Only trigger when an expense finishes processing
+        IF NEW.status NOT IN ('posted', 'error', 'flagged') THEN
+            RETURN NEW;
+        END IF;
+    END IF;
+
+    -- Count currently processing expenses
+    SELECT COUNT(*) INTO processing_count
+    FROM zoho_expenses
+    WHERE status = 'processing';
+
+    slots_available := max_concurrent - processing_count;
+
+    -- Process up to slots_available pending expenses
+    WHILE slots_available > 0 LOOP
+        -- Claim next pending expense
+        -- FOR UPDATE SKIP LOCKED prevents race conditions
+        UPDATE zoho_expenses
+        SET
+            status = 'processing',
+            processing_started_at = NOW(),
+            processing_attempts = processing_attempts + 1
+        WHERE id = (
+            SELECT id FROM zoho_expenses
+            WHERE status = 'pending'
+            ORDER BY created_at ASC  -- FIFO order
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED   -- Skip if another transaction has this row
+        )
+        RETURNING * INTO next_expense;
+
+        -- Exit if no more pending expenses
+        IF next_expense IS NULL THEN
+            EXIT;
+        END IF;
+
+        -- Call n8n webhook to process this expense
+        PERFORM net.http_post(
+            url := 'https://n8n.as3drivertraining.com/webhook/process-expense',
+            body := jsonb_build_object('expense_id', next_expense.id)::text,
+            headers := jsonb_build_object(
+                'Content-Type', 'application/json'
+            )
+        );
+
+        slots_available := slots_available - 1;
+    END LOOP;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+### Queue Controller Triggers
+
+```sql
+-- Trigger: After INSERT (new expense arrives from Edge Function)
+CREATE TRIGGER trigger_queue_on_insert
+    AFTER INSERT ON zoho_expenses
+    FOR EACH ROW
+    EXECUTE FUNCTION process_expense_queue();
+
+-- Trigger: After UPDATE (expense finishes processing)
+-- Only fires when status changes to a completion state
+CREATE TRIGGER trigger_queue_on_completion
+    AFTER UPDATE OF status ON zoho_expenses
+    FOR EACH ROW
+    WHEN (NEW.status IN ('posted', 'error', 'flagged'))
+    EXECUTE FUNCTION process_expense_queue();
+```
+
+**How It Works:**
+
+1. **New Expense Arrives** → `trigger_queue_on_insert` fires
+2. **Check Capacity** → Count expenses with `status = 'processing'`
+3. **Claim Pending Expense** → Update status to 'processing' using `FOR UPDATE SKIP LOCKED`
+4. **Call n8n** → Use `net.http_post()` to trigger processing webhook
+5. **Expense Completes** → `trigger_queue_on_completion` fires, process next in queue
+
+**Race Condition Protection:**
+- `FOR UPDATE SKIP LOCKED` ensures only one trigger claims each expense
+- Multiple concurrent inserts/completions are handled safely
+- FIFO ordering (`ORDER BY created_at ASC`) ensures fairness
+
+**Load Balancing:**
+- Maximum 5 concurrent n8n executions (adjustable via `max_concurrent`)
+- Automatic backpressure when n8n is at capacity
+- New expenses queue until slots become available
+
+---
+
 ## Indexes
 
 All indexes are defined within table creation statements above. Summary:
@@ -471,6 +726,7 @@ For initial deployment (single organization), use simple policies. Prepare for m
 -- Enable RLS on all tables
 ALTER TABLE bank_transactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE expense_queue ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zoho_expenses ENABLE ROW LEVEL SECURITY;
 ALTER TABLE monday_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE categorization_history ENABLE ROW LEVEL SECURITY;
 ALTER TABLE vendor_rules ENABLE ROW LEVEL SECURITY;
@@ -485,6 +741,9 @@ CREATE POLICY "Allow authenticated users" ON bank_transactions
 CREATE POLICY "Allow authenticated users" ON expense_queue
     FOR ALL USING (auth.role() = 'authenticated');
 
+CREATE POLICY "Allow authenticated users" ON zoho_expenses
+    FOR ALL USING (auth.role() = 'authenticated');
+
 CREATE POLICY "Allow authenticated users" ON monday_events
     FOR ALL USING (auth.role() = 'authenticated');
 
@@ -497,11 +756,14 @@ CREATE POLICY "Allow authenticated users" ON vendor_rules
 CREATE POLICY "Allow authenticated users" ON qbo_accounts
     FOR ALL USING (auth.role() = 'authenticated');
 
--- Service role bypass for n8n webhooks
+-- Service role bypass for n8n webhooks and Edge Functions
 CREATE POLICY "Service role full access" ON bank_transactions
     FOR ALL USING (auth.role() = 'service_role');
 
 CREATE POLICY "Service role full access" ON expense_queue
+    FOR ALL USING (auth.role() = 'service_role');
+
+CREATE POLICY "Service role full access" ON zoho_expenses
     FOR ALL USING (auth.role() = 'service_role');
 
 CREATE POLICY "Service role full access" ON categorization_history
@@ -715,7 +977,36 @@ CREATE TABLE IF NOT EXISTS expense_queue (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 3. Create monday_events table
+-- 3. Create zoho_expenses table (queue-based processing)
+CREATE TABLE IF NOT EXISTS zoho_expenses (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    zoho_expense_id TEXT UNIQUE NOT NULL,
+    zoho_report_id TEXT NOT NULL,
+    zoho_report_name TEXT,
+    raw_payload JSONB NOT NULL,
+    expense_date DATE NOT NULL,
+    amount DECIMAL(10,2) NOT NULL,
+    merchant_name TEXT,
+    category_name TEXT,
+    state_tag TEXT,
+    paid_through TEXT,
+    receipt_storage_path TEXT,
+    receipt_content_type TEXT,
+    status TEXT DEFAULT 'pending'
+        CHECK (status IN ('pending', 'processing', 'matched', 'posted', 'flagged', 'error')),
+    processing_attempts INT DEFAULT 0,
+    processing_started_at TIMESTAMPTZ,
+    last_error TEXT,
+    flag_reason TEXT,
+    bank_transaction_id UUID REFERENCES bank_transactions(id),
+    match_confidence INT CHECK (match_confidence >= 0 AND match_confidence <= 100),
+    qbo_purchase_id TEXT,
+    qbo_posted_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    processed_at TIMESTAMPTZ
+);
+
+-- 4. Create monday_events table (currently not used - n8n queries API directly)
 CREATE TABLE IF NOT EXISTS monday_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     monday_item_id TEXT NOT NULL UNIQUE,
@@ -737,16 +1028,19 @@ CREATE TABLE IF NOT EXISTS monday_events (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 4. Add bank_transaction_id to categorization_history
+-- 5. Enable pg_net extension for queue controller
+CREATE EXTENSION IF NOT EXISTS pg_net WITH SCHEMA extensions;
+
+-- 6. Add bank_transaction_id to categorization_history
 ALTER TABLE categorization_history
     ADD COLUMN IF NOT EXISTS bank_transaction_id UUID;
 
--- 5. Add tracking columns to vendor_rules
+-- 7. Add tracking columns to vendor_rules
 ALTER TABLE vendor_rules ADD COLUMN IF NOT EXISTS match_count INTEGER DEFAULT 0;
 ALTER TABLE vendor_rules ADD COLUMN IF NOT EXISTS last_matched_at TIMESTAMPTZ;
 ALTER TABLE vendor_rules ADD COLUMN IF NOT EXISTS created_by TEXT;
 
--- 6. Create indexes
+-- 8. Create indexes
 CREATE INDEX IF NOT EXISTS idx_bank_txn_status ON bank_transactions(status);
 CREATE INDEX IF NOT EXISTS idx_bank_txn_date ON bank_transactions(transaction_date);
 CREATE INDEX IF NOT EXISTS idx_bank_txn_amount ON bank_transactions(amount);
@@ -758,20 +1052,30 @@ CREATE INDEX IF NOT EXISTS idx_expense_queue_status ON expense_queue(status);
 CREATE INDEX IF NOT EXISTS idx_expense_queue_date ON expense_queue(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_expense_queue_reimbursement ON expense_queue(is_reimbursement)
     WHERE is_reimbursement = true;
+CREATE INDEX IF NOT EXISTS idx_zoho_expenses_status ON zoho_expenses(status);
+CREATE INDEX IF NOT EXISTS idx_zoho_expenses_pending ON zoho_expenses(status, created_at)
+    WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_zoho_expenses_processing ON zoho_expenses(status, processing_started_at)
+    WHERE status = 'processing';
+CREATE INDEX IF NOT EXISTS idx_zoho_expenses_bank_txn ON zoho_expenses(bank_transaction_id);
+CREATE INDEX IF NOT EXISTS idx_zoho_expenses_date ON zoho_expenses(expense_date);
 CREATE INDEX IF NOT EXISTS idx_monday_events_dates ON monday_events(start_date, end_date);
 CREATE INDEX IF NOT EXISTS idx_monday_events_state ON monday_events(state);
 CREATE INDEX IF NOT EXISTS idx_cat_history_bank_txn ON categorization_history(bank_transaction_id);
 CREATE INDEX IF NOT EXISTS idx_cat_history_zoho_id ON categorization_history(zoho_expense_id);
 
--- 7. Enable RLS
+-- 9. Enable RLS
 ALTER TABLE bank_transactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE expense_queue ENABLE ROW LEVEL SECURITY;
+ALTER TABLE zoho_expenses ENABLE ROW LEVEL SECURITY;
 ALTER TABLE monday_events ENABLE ROW LEVEL SECURITY;
 
--- 8. Create RLS policies
+-- 10. Create RLS policies
 CREATE POLICY "Allow authenticated users" ON bank_transactions
     FOR ALL USING (auth.role() = 'authenticated');
 CREATE POLICY "Allow authenticated users" ON expense_queue
+    FOR ALL USING (auth.role() = 'authenticated');
+CREATE POLICY "Allow authenticated users" ON zoho_expenses
     FOR ALL USING (auth.role() = 'authenticated');
 CREATE POLICY "Allow authenticated users" ON monday_events
     FOR ALL USING (auth.role() = 'authenticated');
@@ -779,8 +1083,10 @@ CREATE POLICY "Service role full access" ON bank_transactions
     FOR ALL USING (auth.role() = 'service_role');
 CREATE POLICY "Service role full access" ON expense_queue
     FOR ALL USING (auth.role() = 'service_role');
+CREATE POLICY "Service role full access" ON zoho_expenses
+    FOR ALL USING (auth.role() = 'service_role');
 
--- 9. Create updated_at trigger function
+-- 11. Create updated_at trigger function
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -789,7 +1095,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- 10. Apply triggers
+-- 12. Apply triggers for updated_at
 CREATE TRIGGER update_bank_transactions_updated_at
     BEFORE UPDATE ON bank_transactions
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
@@ -802,7 +1108,82 @@ CREATE TRIGGER update_monday_events_updated_at
     BEFORE UPDATE ON monday_events
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
--- 11. Create dashboard stats view
+-- 13. Create queue controller function
+CREATE OR REPLACE FUNCTION process_expense_queue()
+RETURNS TRIGGER AS $$
+DECLARE
+    processing_count INT;
+    next_expense RECORD;
+    slots_available INT;
+    max_concurrent CONSTANT INT := 5;  -- Maximum concurrent n8n executions
+BEGIN
+    -- Only act on relevant events
+    IF TG_OP = 'UPDATE' THEN
+        -- Only trigger when an expense finishes processing
+        IF NEW.status NOT IN ('posted', 'error', 'flagged') THEN
+            RETURN NEW;
+        END IF;
+    END IF;
+
+    -- Count currently processing expenses
+    SELECT COUNT(*) INTO processing_count
+    FROM zoho_expenses
+    WHERE status = 'processing';
+
+    slots_available := max_concurrent - processing_count;
+
+    -- Process up to slots_available pending expenses
+    WHILE slots_available > 0 LOOP
+        -- Claim next pending expense
+        -- FOR UPDATE SKIP LOCKED prevents race conditions
+        UPDATE zoho_expenses
+        SET
+            status = 'processing',
+            processing_started_at = NOW(),
+            processing_attempts = processing_attempts + 1
+        WHERE id = (
+            SELECT id FROM zoho_expenses
+            WHERE status = 'pending'
+            ORDER BY created_at ASC  -- FIFO order
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED   -- Skip if another transaction has this row
+        )
+        RETURNING * INTO next_expense;
+
+        -- Exit if no more pending expenses
+        IF next_expense IS NULL THEN
+            EXIT;
+        END IF;
+
+        -- Call n8n webhook to process this expense
+        PERFORM net.http_post(
+            url := 'https://n8n.as3drivertraining.com/webhook/process-expense',
+            body := jsonb_build_object('expense_id', next_expense.id)::text,
+            headers := jsonb_build_object(
+                'Content-Type', 'application/json'
+            )
+        );
+
+        slots_available := slots_available - 1;
+    END LOOP;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 14. Create queue controller triggers
+CREATE TRIGGER trigger_queue_on_insert
+    AFTER INSERT ON zoho_expenses
+    FOR EACH ROW
+    EXECUTE FUNCTION process_expense_queue();
+
+CREATE TRIGGER trigger_queue_on_completion
+    AFTER UPDATE OF status ON zoho_expenses
+    FOR EACH ROW
+    WHEN (NEW.status IN ('posted', 'error', 'flagged'))
+    EXECUTE FUNCTION process_expense_queue();
+
+-- 15. Create dashboard stats view
 CREATE OR REPLACE VIEW dashboard_stats AS
 SELECT
     -- Review queues
