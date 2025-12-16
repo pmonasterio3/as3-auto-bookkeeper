@@ -52,16 +52,44 @@ export function normalizeZohoExpense(
     ? Math.floor((Date.now() - new Date(expense.created_at).getTime()) / (1000 * 60 * 60 * 24))
     : 0
 
-  // Determine reason for flagging
-  let reason = 'Flagged for review'
+  // Determine reason for flagging - build comprehensive reason with all issues
+  const issues: string[] = []
+
+  // Check for processing error first
   if (expense.last_error) {
-    reason = expense.last_error
-  } else if (expense.match_confidence !== null && expense.match_confidence < 95) {
-    reason = `Low match confidence (${expense.match_confidence}%) - needs verification`
-  } else if (!expense.bank_transaction_id) {
-    reason = 'No matching bank transaction found'
-  } else if (!expense.state_tag) {
-    reason = 'Missing state tag - needs manual assignment'
+    issues.push(expense.last_error.length > 80
+      ? expense.last_error.substring(0, 80) + '...'
+      : expense.last_error)
+  }
+
+  // Check for bank transaction match issues
+  if (!expense.bank_transaction_id) {
+    issues.push('No bank transaction match found - manual match required')
+  }
+
+  // Check confidence level (only if we have a match but low confidence)
+  if (expense.bank_transaction_id && expense.match_confidence !== null && expense.match_confidence < 95) {
+    issues.push(`Low match confidence (${expense.match_confidence}%) - verify bank match is correct`)
+  }
+
+  // Check for missing state
+  if (!expense.state_tag) {
+    issues.push('Missing state tag - assign state before resubmitting')
+  }
+
+  // Check for missing receipt
+  if (!expense.receipt_storage_path) {
+    issues.push('No receipt attached')
+  }
+
+  // Build final reason string
+  let reason: string
+  if (issues.length === 0) {
+    reason = 'Flagged for manual review'
+  } else if (issues.length === 1) {
+    reason = issues[0]
+  } else {
+    reason = issues.join(' • ')
   }
 
   return {

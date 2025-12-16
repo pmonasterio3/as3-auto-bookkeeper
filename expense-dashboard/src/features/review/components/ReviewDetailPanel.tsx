@@ -31,12 +31,15 @@ import {
   User,
   UserCheck,
   Calendar,
-  Clock
+  Clock,
+  Search,
+  Link
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { formatCurrency, formatDate, formatRelativeTime } from '@/lib/utils'
 import type { ReviewItem, ReviewAction, CorrectionData } from '../types'
-import type { QboAccount, QboClass } from '@/types/database'
+import type { QboAccount, QboClass, BankTransaction } from '@/types/database'
+import { BankTransactionPicker } from './BankTransactionPicker'
 
 interface ReviewDetailPanelProps {
   item: ReviewItem | null
@@ -71,6 +74,10 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
   // Which field is being edited
   const [editingField, setEditingField] = useState<string | null>(null)
 
+  // Bank transaction picker state (for manual matching)
+  const [showBankPicker, setShowBankPicker] = useState(false)
+  const [selectedBankTxn, setSelectedBankTxn] = useState<BankTransaction | null>(null)
+
   useEffect(() => {
     if (!item) return
 
@@ -81,6 +88,8 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
     setCreateRule(false)
     setEditingField(null)
     setActionError(null)
+    setShowBankPicker(false)
+    setSelectedBankTxn(null)
 
     async function fetchData() {
       const [accountsRes, classesRes] = await Promise.all([
@@ -106,6 +115,7 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
         state: state || undefined,
         notes: notes || undefined,
         createVendorRule: createRule,
+        bankTransactionId: selectedBankTxn?.id || undefined,
       })
       onClose()
     } catch (err) {
@@ -117,7 +127,8 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
 
   const hasChanges = category !== (item.predictions?.category || item.zoho?.categoryName || '') ||
     state !== (item.predictions?.state || '') ||
-    vendor !== (item.vendor || '')
+    vendor !== (item.vendor || '') ||
+    selectedBankTxn !== null
 
   const cosAccounts = qboAccounts.filter(a => a.is_cogs)
   const expenseAccounts = qboAccounts.filter(a => a.account_type === 'Expenses' && !a.is_cogs)
@@ -300,6 +311,76 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
                   <div className="text-[10px] text-gray-500 mt-1.5">
                     Transaction date: {formatDate(item.bankTransaction.date)}
                   </div>
+                </div>
+              )}
+
+              {/* Manual Bank Transaction Matching (for zoho_expenses without match) */}
+              {item.sourceTable === 'zoho_expenses' && !item.bankTransaction && (
+                <div className="space-y-2">
+                  {/* Show selected bank transaction if user picked one */}
+                  {selectedBankTxn && !showBankPicker && (
+                    <div className="p-3 bg-green-50 rounded-lg border border-green-200">
+                      <div className="flex items-center gap-2 mb-2">
+                        <Link className="h-4 w-4 text-green-600" />
+                        <span className="text-[10px] font-semibold text-green-700 uppercase tracking-wide">
+                          Manual Match Selected
+                        </span>
+                        <button
+                          onClick={() => setShowBankPicker(true)}
+                          className="ml-auto text-[10px] text-green-600 hover:text-green-800 underline"
+                        >
+                          Change
+                        </button>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <CreditCard className="h-3.5 w-3.5 text-gray-400" />
+                        <span className="text-[10px] text-gray-500 uppercase">
+                          {selectedBankTxn.source === 'amex' ? 'AMEX' : 'WF'}
+                        </span>
+                        <span className="text-xs text-gray-500">{formatDate(selectedBankTxn.transaction_date)}</span>
+                        <span className="ml-auto text-sm font-semibold text-green-700 tabular-nums">
+                          {formatCurrency(selectedBankTxn.amount)}
+                        </span>
+                      </div>
+                      <div className="text-xs font-mono text-gray-700 leading-relaxed bg-white px-2 py-1.5 rounded border border-green-100 mt-1.5">
+                        {selectedBankTxn.extracted_vendor || selectedBankTxn.description.substring(0, 50)}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Show "Find Bank Match" button when no match and picker not open */}
+                  {!selectedBankTxn && !showBankPicker && (
+                    <button
+                      onClick={() => setShowBankPicker(true)}
+                      className="w-full p-3 bg-amber-50 rounded-lg border border-amber-200 hover:bg-amber-100 transition-colors group"
+                    >
+                      <div className="flex items-center gap-2">
+                        <Search className="h-4 w-4 text-amber-600" />
+                        <span className="text-sm font-medium text-amber-800">Find Bank Transaction Match</span>
+                        <span className="ml-auto text-[10px] text-amber-600 group-hover:underline">
+                          Search →
+                        </span>
+                      </div>
+                      <div className="text-[10px] text-amber-700 mt-1 text-left">
+                        No automatic match found. Click to manually search and link a bank transaction.
+                      </div>
+                    </button>
+                  )}
+
+                  {/* Bank Transaction Picker */}
+                  {showBankPicker && (
+                    <BankTransactionPicker
+                      expenseAmount={item.amount}
+                      expenseDate={item.date}
+                      expenseVendor={item.vendor}
+                      currentBankTxnId={selectedBankTxn?.id}
+                      onSelect={(txn) => {
+                        setSelectedBankTxn(txn)
+                        setShowBankPicker(false)
+                      }}
+                      onCancel={() => setShowBankPicker(false)}
+                    />
+                  )}
                 </div>
               )}
 

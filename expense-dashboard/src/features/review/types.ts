@@ -166,4 +166,5 @@ export interface CorrectionData {
   state?: string
   notes?: string
   createVendorRule?: boolean
+  bankTransactionId?: string  // For manual bank transaction matching
 }

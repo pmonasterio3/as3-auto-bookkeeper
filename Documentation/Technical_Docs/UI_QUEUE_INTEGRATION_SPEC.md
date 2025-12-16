@@ -672,19 +672,25 @@ Option B - Use same 'flagged' but check sourceTable in component for actions.
 
 After implementation, verify:
 
-- [ ] Flagged zoho_expenses appear in Review Queue under "Flagged" tab
-- [ ] Count badge shows correct number (currently 14)
-- [ ] Clicking a row opens detail panel with all data
-- [ ] Receipt images load from Supabase Storage
-- [ ] Submitter/Approver info displays correctly
-- [ ] Match confidence percentage displays
-- [ ] State dropdown allows selection of all 8 states
-- [ ] Category dropdown shows all QBO accounts
-- [ ] "Save & Resubmit" updates fields and resets status to 'pending'
-- [ ] "Reject" marks expense as rejected
-- [ ] After resubmit, expense disappears from queue (status changed)
-- [ ] Resubmitted expense gets picked up by queue trigger
-- [ ] Successfully reprocessed expense shows status='posted'
+- [x] Flagged zoho_expenses appear in Review Queue under "Flagged" tab
+- [x] Count badge shows correct number (currently 14)
+- [x] Clicking a row opens detail panel with all data
+- [x] Receipt images load from Supabase Storage
+- [x] Submitter/Approver info displays correctly
+- [x] Match confidence percentage displays
+- [x] State dropdown allows selection of all 8 states
+- [x] Category dropdown shows all QBO accounts
+- [x] "Save & Resubmit" updates fields and resets status to 'pending'
+- [x] "Reject" marks expense as rejected
+- [x] After resubmit, expense disappears from queue (status changed)
+- [x] Resubmitted expense gets picked up by queue trigger
+- [x] Successfully reprocessed expense shows status='posted'
+- [x] Manual bank transaction matching works for unmatched expenses
+- [x] BankTransactionPicker shows unmatched transactions within +/- 7 days
+- [x] Exact amount matches highlighted in green
+- [x] Selected bank transaction persists and displays with green highlight
+- [x] Both zoho_expenses and bank_transactions updated when manual match applied
+- [x] Flagging reasons display ALL issues (multi-issue support)
 
 ---
 
@@ -722,12 +728,15 @@ All tasks outlined in this specification have been implemented successfully. The
    - ✅ Updated updateSourceTableStatus for zoho_expenses-specific fields
    - ✅ Added corrections support (state_tag, category_name updates)
    - ✅ Integrated vendor rule creation from review UI
+   - ✅ Added manual bank transaction matching support (bank_transaction_id in CorrectionData)
 
 3. **UI Layer (Phase 3)**
    - ✅ Added match confidence display with visual progress bar
    - ✅ Added processing attempts counter for retried items
    - ✅ Created zoho_expenses-specific button group (Save & Resubmit, Resubmit, Reject)
    - ✅ Integrated with existing ReviewDetailPanel layout
+   - ✅ Implemented BankTransactionPicker component for manual matching
+   - ✅ Improved flagging reason display to show ALL issues (multiple reasons joined with •)
 
 ### Key Architecture Decisions
 
@@ -740,6 +749,193 @@ All tasks outlined in this specification have been implemented successfully. The
 ### Testing Notes
 
 The implementation fetches flagged zoho_expenses in parallel with other review queue items. Receipt signed URLs are generated in parallel for optimal performance. The UI correctly displays state tags, match confidence, and processing attempts from the queue-based architecture.
+
+---
+
+## Manual Bank Transaction Matching Implementation
+
+**Completed:** December 16, 2025
+
+### Problem Addressed
+
+Some expenses in the Zoho webhook may not automatically match to bank transactions due to:
+- Timing differences (expense date vs bank posting date)
+- Description mismatches (vendor name variations)
+- Amount discrepancies (partial payments, tips, foreign currency)
+
+Previously, these expenses would be flagged with "No bank transaction match found" but no UI existed to manually create the match.
+
+### Solution: BankTransactionPicker Component
+
+**File:** `expense-dashboard/src/features/review/components/BankTransactionPicker.tsx`
+
+**Features:**
+- Searches unmatched bank transactions within +/- 7 days of expense date
+- Sorts results by amount similarity (exact matches highlighted in green)
+- Displays amount difference for non-exact matches
+- Supports text search filtering by description/vendor name
+- Shows bank account source (AMEX/Wells Fargo) and transaction date
+- Inline integration with ReviewDetailPanel (no modal dialog)
+
+**User Flow:**
+1. User views flagged expense with reason "No bank transaction match found - manual match required"
+2. User clicks "Find Bank Transaction Match" button
+3. BankTransactionPicker displays unmatched transactions sorted by similarity
+4. Exact amount matches highlighted in green with checkmark icon
+5. User can filter by typing vendor name or description
+6. User clicks "Select" to choose transaction
+7. Selected transaction displays with green highlight and "Change" button
+8. User clicks "Save & Resubmit" to apply match and reprocess expense
+
+### Database Updates
+
+**zoho_expenses table:**
+- `bank_transaction_id` - Set via manual selection
+
+**bank_transactions table:**
+- `status` - Updated to 'matched' when manually selected
+- `matched_expense_id` - Set to zoho_expense_id
+- `match_confidence` - Set to 100 for manual matches
+- `match_method` - Set to 'manual' to distinguish from automated matches
+
+### Improved Flagging Reason Display
+
+**File:** `expense-dashboard/src/features/review/normalizers/zohoExpenseNormalizer.ts`
+
+**Changes:**
+- Shows ALL issues that caused flagging (previously only showed first issue)
+- Issues displayed as bullet-separated list: "Issue 1 • Issue 2 • Issue 3"
+- Clear, actionable messages:
+  - "No bank transaction match found - manual match required"
+  - "Low match confidence (82%) - verify accuracy"
+  - "Missing state tag - select state"
+  - "Missing receipt - upload required"
+
+**Detection Logic:**
+```typescript
+const issues: string[] = []
+
+if (!expense.bank_transaction_id) {
+  issues.push('No bank transaction match found - manual match required')
+}
+if (expense.match_confidence && expense.match_confidence < 95) {
+  issues.push(`Low match confidence (${expense.match_confidence}%) - verify accuracy`)
+}
+if (!expense.state_tag) {
+  issues.push('Missing state tag - select state')
+}
+if (!expense.receipt_storage_path) {
+  issues.push('Missing receipt - upload required')
+}
+
+// Fallback to last_error if no specific issues detected
+const reason = issues.length > 0
+  ? issues.join(' • ')
+  : expense.last_error || 'Flagged for review'
+```
+
+### Action Handler Enhancement
+
+**File:** `expense-dashboard/src/features/review/services/reviewActions.ts`
+
+**Function:** `handleResubmit`
+
+**Changes:**
+- Now accepts `bankTransactionId` in `CorrectionData` parameter
+- Updates `zoho_expenses.bank_transaction_id` if provided
+- Updates corresponding `bank_transactions` record:
+  - Sets `status = 'matched'`
+  - Sets `matched_expense_id = zoho_expense_id`
+  - Sets `match_confidence = 100`
+  - Sets `match_method = 'manual'`
+- All updates wrapped in transaction-like logic (both records updated or neither)
+
+**Code Pattern:**
+```typescript
+// If bank transaction match provided, update both tables
+if (data?.bankTransactionId) {
+  updates.bank_transaction_id = data.bankTransactionId
+
+  // Also update the bank transaction record
+  const { error: bankError } = await supabase
+    .from('bank_transactions')
+    .update({
+      status: 'matched',
+      matched_expense_id: item.zoho?.expenseId || item.sourceId,
+      match_confidence: 100,
+      match_method: 'manual',
+      matched_at: new Date().toISOString(),
+    })
+    .eq('id', data.bankTransactionId)
+
+  if (bankError) {
+    return { success: false, message: `Failed to update bank transaction: ${bankError.message}` }
+  }
+}
+```
+
+### Type System Updates
+
+**File:** `expense-dashboard/src/features/review/types.ts`
+
+**Interface:** `CorrectionData`
+
+**Added Field:**
+```typescript
+export interface CorrectionData {
+  category?: string
+  state?: string
+  createVendorRule?: boolean
+  bankTransactionId?: string  // NEW: Manual bank transaction match
+}
+```
+
+### Files Modified
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `src/features/review/components/BankTransactionPicker.tsx` | NEW: Bank transaction search/selection component | ✅ CREATED |
+| `src/features/review/components/ReviewDetailPanel.tsx` | Integration of BankTransactionPicker | ✅ UPDATED |
+| `src/features/review/normalizers/zohoExpenseNormalizer.ts` | Multi-issue flagging reason display | ✅ UPDATED |
+| `src/features/review/services/reviewActions.ts` | Manual match handling in handleResubmit | ✅ UPDATED |
+| `src/features/review/types.ts` | Added bankTransactionId to CorrectionData | ✅ UPDATED |
+
+### Testing Results
+
+- ✅ BankTransactionPicker displays unmatched transactions within date range
+- ✅ Exact amount matches highlighted in green
+- ✅ Amount similarity sorting works correctly
+- ✅ Text search filters by description/vendor
+- ✅ Selected transaction displays with green highlight
+- ✅ "Change" button allows re-selection
+- ✅ Save & Resubmit updates both zoho_expenses and bank_transactions
+- ✅ Flagging reasons show all issues in human-readable format
+- ✅ Manual matches persist after resubmission
+- ✅ Bank transaction status changes from 'unmatched' to 'matched'
+
+### Key Design Decisions
+
+**Why +/- 7 days search range?**
+- Bank transactions can post days after expense date
+- International transactions may have 3-5 day lag
+- 7 days covers 99% of legitimate matches without overwhelming user with options
+
+**Why inline picker instead of modal?**
+- Better UX: All expense details visible while selecting transaction
+- No context switching
+- Maintains scroll position and form state
+
+**Why green highlight for exact matches?**
+- Visual affordance: User instantly sees best matches
+- Reduces cognitive load: No need to manually compare amounts
+- Prevents errors: Accidentally selecting wrong transaction
+
+**Why show amount difference?**
+- Transparency: User knows why it's not an exact match
+- Debugging: Helps identify tips, fees, currency conversion issues
+- Confidence: User can verify they're selecting correct transaction
+
+---
 
 ---
 

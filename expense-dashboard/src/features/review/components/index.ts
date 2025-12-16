@@ -2,6 +2,7 @@
 export { ReviewRow } from './ReviewRow'
 export { ReviewDetailPanel } from './ReviewDetailPanel'
 export { FixRetryForm } from './FixRetryForm'
+export { BankTransactionPicker } from './BankTransactionPicker'
 
 // Legacy card components (to be removed after migration)
 export { ReviewCard } from './ReviewCard'

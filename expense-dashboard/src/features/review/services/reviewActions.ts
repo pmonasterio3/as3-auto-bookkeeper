@@ -304,6 +304,10 @@ async function handleCreateVendorRule(
  * This is specific to the queue-based architecture v3.0. When a user
  * corrects a flagged expense and resubmits, we reset the status to 'pending'
  * so the queue controller will pick it up again and trigger n8n processing.
+ *
+ * If a manual bank transaction match is provided, we:
+ * 1. Set bank_transaction_id on the zoho_expense
+ * 2. Update the bank_transaction status to 'matched' with matched_expense_id
  */
 async function handleResubmit(
   item: ReviewItem,
@@ -330,6 +334,28 @@ async function handleResubmit(
     updates.category_name = data.category
   }
 
+  // Handle manual bank transaction matching
+  if (data?.bankTransactionId) {
+    updates.bank_transaction_id = data.bankTransactionId
+    updates.match_confidence = 100 // Manual match = 100% confidence
+
+    // Update the bank_transactions table to mark as matched
+    const { error: bankError } = await supabase
+      .from('bank_transactions')
+      .update({
+        status: 'matched',
+        matched_expense_id: item.sourceId,
+        matched_at: new Date().toISOString(),
+        matched_by: 'human', // CHECK constraint only allows: 'agent', 'human', NULL
+      })
+      .eq('id', data.bankTransactionId)
+
+    if (bankError) {
+      console.error('Failed to update bank transaction:', bankError)
+      return { success: false, message: `Failed to link bank transaction: ${bankError.message}` }
+    }
+  }
+
   const { error } = await supabase
     .from('zoho_expenses')
     .update(updates)
@@ -349,7 +375,7 @@ async function handleResubmit(
   }
 
   // Log correction if changes were made
-  if (data?.category || data?.state) {
+  if (data?.category || data?.state || data?.bankTransactionId) {
     await logCorrection(
       item,
       data.category || item.predictions?.category || 'Office Supplies & Software',
@@ -357,9 +383,13 @@ async function handleResubmit(
     )
   }
 
+  const message = data?.bankTransactionId
+    ? 'Expense matched to bank transaction and resubmitted for processing'
+    : 'Expense resubmitted for processing'
+
   return {
     success: true,
-    message: 'Expense resubmitted for processing',
+    message,
   }
 }
 
