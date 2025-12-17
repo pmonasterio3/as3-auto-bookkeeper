@@ -34,6 +34,7 @@ export type ReviewAction =
   | 'ignore'
   | 'create_vendor_rule'
   | 'resubmit'
+  | 'delete'
 
 export type PredictionMethod =
   | 'vendor_rule'

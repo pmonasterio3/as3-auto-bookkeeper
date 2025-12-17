@@ -52,6 +52,9 @@ export async function executeReviewAction(
     case 'resubmit':
       return handleResubmit(item, data)
 
+    case 'delete':
+      return handleDelete(item)
+
     default:
       return { success: false, message: `Unknown action: ${action}` }
   }
@@ -390,6 +393,63 @@ async function handleResubmit(
   return {
     success: true,
     message,
+  }
+}
+
+/**
+ * Handle deletion of zoho_expenses items
+ *
+ * Used when an expense was:
+ * - Paid through another account (not a corporate card)
+ * - Uploaded by mistake
+ * - A duplicate that shouldn't be processed
+ *
+ * This permanently removes the record from zoho_expenses and any
+ * associated receipt from storage.
+ */
+async function handleDelete(item: ReviewItem): Promise<ActionResult> {
+  if (item.sourceTable !== 'zoho_expenses') {
+    return { success: false, message: 'Can only delete zoho_expenses items' }
+  }
+
+  // First, get the expense to check for receipt storage path
+  const { data: expense, error: fetchError } = await supabase
+    .from('zoho_expenses')
+    .select('receipt_storage_path')
+    .eq('id', item.sourceId)
+    .single()
+
+  if (fetchError) {
+    console.error('Failed to fetch expense for deletion:', fetchError)
+    return { success: false, message: `Failed to fetch expense: ${fetchError.message}` }
+  }
+
+  // Delete receipt from storage if it exists
+  if (expense?.receipt_storage_path) {
+    const { error: storageError } = await supabase.storage
+      .from('expense-receipts')
+      .remove([expense.receipt_storage_path])
+
+    if (storageError) {
+      console.warn('Failed to delete receipt from storage:', storageError)
+      // Continue with deletion even if storage cleanup fails
+    }
+  }
+
+  // Delete the expense record
+  const { error: deleteError } = await supabase
+    .from('zoho_expenses')
+    .delete()
+    .eq('id', item.sourceId)
+
+  if (deleteError) {
+    console.error('Failed to delete expense:', deleteError)
+    return { success: false, message: `Failed to delete expense: ${deleteError.message}` }
+  }
+
+  return {
+    success: true,
+    message: 'Expense deleted successfully',
   }
 }
 

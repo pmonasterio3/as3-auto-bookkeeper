@@ -33,7 +33,8 @@ import {
   Calendar,
   Clock,
   Search,
-  Link
+  Link,
+  Trash2
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { formatCurrency, formatDate, formatRelativeTime } from '@/lib/utils'
@@ -600,9 +601,19 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
             <Button variant="outline" size="sm" onClick={() => handleAction('resubmit')} disabled={isLoading}>
               Resubmit
             </Button>
-            <Button variant="ghost" size="sm" onClick={() => handleAction('reject')} disabled={isLoading}>
-              <X className="h-4 w-4" />
-              <span className="ml-1">Reject</span>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                if (confirm('Delete this expense? This cannot be undone.')) {
+                  handleAction('delete')
+                }
+              }}
+              disabled={isLoading}
+              className="text-red-600 hover:text-red-700 hover:bg-red-50"
+            >
+              <Trash2 className="h-4 w-4" />
+              <span className="ml-1">Delete</span>
             </Button>
           </>
         )}
