@@ -19,6 +19,7 @@ export type ItemType =
   | 'flagged'
   | 'orphan'
   | 'processing_error'
+  | 'stuck'
 
 export type ReviewAction =
   | 'approve'
@@ -149,6 +150,7 @@ export type ReviewFilter =
   | 'flagged'
   | 'orphan'
   | 'processing_error'
+  | 'stuck'
 
 /**
  * Result from executing a review action

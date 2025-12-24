@@ -42,6 +42,7 @@ export type StateCode = (typeof STATES)[number]
  * Lower number = higher priority (process first)
  */
 export const ITEM_TYPE_PRIORITIES: Record<string, number> = {
+  stuck: 0,               // Stuck in processing - urgent
   processing_error: 0.5,  // System failures - fix ASAP
   reimbursement: 1,       // Employee waiting for money
   flagged: 1.5,           // Flagged by AI
@@ -88,6 +89,12 @@ export const ITEM_TYPE_COLORS: Record<string, {
     badge: 'bg-purple-100 text-purple-700',
     text: 'text-purple-700',
   },
+  stuck: {
+    border: 'border-rose-200',
+    header: 'bg-rose-50',
+    badge: 'bg-rose-100 text-rose-700',
+    text: 'text-rose-700',
+  },
 }
 
 /**
@@ -99,6 +106,7 @@ export const ITEM_TYPE_LABELS: Record<string, string> = {
   flagged: 'FLAGGED FOR REVIEW',
   low_confidence: 'LOW CONFIDENCE',
   processing_error: 'PROCESSING ERROR',
+  stuck: 'STUCK IN PROCESSING',
 }
 
 /**
@@ -110,6 +118,7 @@ export const ITEM_TYPE_ICONS: Record<string, string> = {
   flagged: 'Flag',
   low_confidence: 'AlertTriangle',
   processing_error: 'AlertCircle',
+  stuck: 'Clock',
 }
 
 /**
@@ -121,6 +130,7 @@ export const DEFAULT_ACTIONS: Record<string, string[]> = {
   flagged: ['approve', 'correct_and_approve', 'reject'],
   low_confidence: ['approve', 'correct_and_approve', 'reject'],
   processing_error: ['retry', 'investigate', 'resolve', 'ignore'],
+  stuck: ['retry', 'reject'],
 }
 
 /**

@@ -216,33 +216,57 @@ async function handleExclusion(item: ReviewItem): Promise<ActionResult> {
 }
 
 /**
- * Handle retry for processing errors
+ * Handle retry for processing errors and stuck expenses
+ *
+ * For stuck zoho_expenses: Calls the manual_reset_expense() database function
+ * to reset status to 'pending' so the queue controller will pick it up again.
+ *
+ * For processing_errors: Marks as retried for n8n to pick up.
  */
 async function handleRetry(item: ReviewItem): Promise<ActionResult> {
-  if (item.sourceTable !== 'processing_errors') {
-    return { success: false, message: 'Can only retry processing errors' }
+  // Handle stuck zoho_expenses
+  if (item.sourceTable === 'zoho_expenses' && item.itemType === 'stuck') {
+    // Reset expense to pending status for reprocessing
+    const { error } = await supabase
+      .from('zoho_expenses')
+      .update({
+        status: 'pending',
+        last_error: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', item.sourceId)
+
+    if (error) {
+      return { success: false, message: `Failed to reset expense: ${error.message}` }
+    }
+
+    return {
+      success: true,
+      message: 'Expense reset to pending - queue will retry automatically',
+    }
   }
 
-  // Update retry count
-  const { error } = await supabase
-    .from('processing_errors')
-    .update({
-      status: 'retried',
-      retry_count: (item.errorDetails?.retryCount || 0) + 1,
-    })
-    .eq('id', item.sourceId)
+  // Handle processing_errors
+  if (item.sourceTable === 'processing_errors') {
+    const { error } = await supabase
+      .from('processing_errors')
+      .update({
+        status: 'retried',
+        retry_count: (item.errorDetails?.retryCount || 0) + 1,
+      })
+      .eq('id', item.sourceId)
 
-  if (error) {
-    return { success: false, message: error.message }
+    if (error) {
+      return { success: false, message: error.message }
+    }
+
+    return {
+      success: true,
+      message: 'Queued for retry',
+    }
   }
 
-  // TODO: Trigger n8n retry workflow
-  // For now, just mark as retried - n8n can pick up retried items
-
-  return {
-    success: true,
-    message: 'Queued for retry',
-  }
+  return { success: false, message: 'Can only retry processing errors or stuck expenses' }
 }
 
 /**

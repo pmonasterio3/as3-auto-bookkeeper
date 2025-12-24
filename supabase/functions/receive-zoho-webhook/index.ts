@@ -1,6 +1,7 @@
 // Supabase Edge Function: receive-zoho-webhook
 // Receives Zoho expense report webhooks and stores expenses in zoho_expenses table
 // This triggers the queue controller to process expenses one-by-one via n8n
+// Also triggers validate-receipt for AI receipt validation
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
@@ -8,46 +9,6 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-}
-
-/**
- * Get a fresh Zoho access token using the refresh token
- * Refresh tokens don't expire, but access tokens expire in 1 hour
- */
-async function getZohoAccessToken(): Promise<string | null> {
-  const clientId = Deno.env.get('ZOHO_CLIENT_ID')
-  const clientSecret = Deno.env.get('ZOHO_CLIENT_SECRET')
-  const refreshToken = Deno.env.get('ZOHO_REFRESH_TOKEN')
-
-  if (!clientId || !clientSecret || !refreshToken) {
-    console.error('Missing Zoho OAuth credentials (ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, ZOHO_REFRESH_TOKEN)')
-    return null
-  }
-
-  try {
-    const response = await fetch('https://accounts.zoho.com/oauth/v2/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'refresh_token',
-        client_id: clientId,
-        client_secret: clientSecret,
-        refresh_token: refreshToken
-      })
-    })
-
-    if (!response.ok) {
-      const errorText = await response.text()
-      console.error('Zoho token refresh failed:', errorText)
-      return null
-    }
-
-    const data = await response.json()
-    return data.access_token
-  } catch (error) {
-    console.error('Zoho token refresh error:', error)
-    return null
-  }
 }
 
 interface ZohoExpense {
@@ -81,6 +42,27 @@ interface ZohoReport {
     user_id: string
   }
   expenses: ZohoExpense[]
+}
+
+// Trigger receipt validation for an expense (fire-and-forget)
+async function triggerReceiptValidation(supabaseUrl: string, expenseId: string): Promise<void> {
+  try {
+    const validateUrl = `${supabaseUrl}/functions/v1/validate-receipt`
+    console.log(`Triggering receipt validation for expense ${expenseId}`)
+
+    // Fire-and-forget - don't await the full response
+    fetch(validateUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expense_id: expenseId })
+    }).then(response => {
+      console.log(`Receipt validation triggered for ${expenseId}: ${response.status}`)
+    }).catch(err => {
+      console.error(`Receipt validation trigger failed for ${expenseId}:`, err.message)
+    })
+  } catch (error) {
+    console.error(`Failed to trigger receipt validation for ${expenseId}:`, error)
+  }
 }
 
 serve(async (req) => {
@@ -152,7 +134,9 @@ serve(async (req) => {
     let insertedCount = 0
     let skippedCount = 0
     let errorCount = 0
+    let validationTriggered = 0
     const errors: string[] = []
+    const expenseIdsToValidate: string[] = []
 
     // Process each expense
     for (const expense of expenses) {
@@ -166,57 +150,40 @@ serve(async (req) => {
         let receiptPath: string | null = null
         let receiptContentType: string | null = null
 
-        // Check if expense has documents (receipt attached)
-        const document = expense.documents?.[0]
-        if (document?.document_id) {
+        if (expense.documents?.[0]?.download_url) {
           try {
-            console.log(`Downloading receipt for expense ${expense.expense_id}, document ${document.document_id}`)
+            console.log(`Downloading receipt for expense ${expense.expense_id}`)
+            const receiptResponse = await fetch(expense.documents[0].download_url)
 
-            // Get fresh Zoho OAuth token using refresh token
-            const zohoAccessToken = await getZohoAccessToken()
-            const zohoOrgId = Deno.env.get('ZOHO_ORG_ID') || '867260975'
+            if (receiptResponse.ok) {
+              const receiptBlob = await receiptResponse.blob()
+              receiptContentType = receiptResponse.headers.get('content-type') || 'image/jpeg'
 
-            if (!zohoAccessToken) {
-              console.error('Could not get Zoho access token - skipping receipt download')
-            } else {
-              // Fetch receipt from Zoho API
-              const receiptUrl = `https://www.zohoapis.com/expense/v1/expenses/${expense.expense_id}/receipt`
-              const receiptResponse = await fetch(receiptUrl, {
-                headers: {
-                  'Authorization': `Zoho-oauthtoken ${zohoAccessToken}`,
-                  'X-com-zoho-expense-organizationid': zohoOrgId
-                }
-              })
+              // Determine file extension from content type
+              let extension = 'jpg'
+              if (receiptContentType.includes('png')) extension = 'png'
+              else if (receiptContentType.includes('pdf')) extension = 'pdf'
+              else if (receiptContentType.includes('jpeg')) extension = 'jpg'
 
-              if (receiptResponse.ok) {
-                const receiptBlob = await receiptResponse.blob()
-                receiptContentType = receiptResponse.headers.get('content-type') || 'image/jpeg'
+              const filename = `${expense.expense_id}.${extension}`
+              receiptPath = `${report.report_id}/${filename}`
 
-                // Determine file extension from document info or content type
-                let extension = document.file_type || 'jpg'
-                if (extension === 'jpeg') extension = 'jpg'
+              // Upload to Supabase Storage
+              const { error: uploadError } = await supabase.storage
+                .from('expense-receipts')
+                .upload(receiptPath, receiptBlob, {
+                  contentType: receiptContentType,
+                  upsert: true  // Overwrite if exists (for re-submissions)
+                })
 
-                const filename = `${expense.expense_id}.${extension}`
-                receiptPath = `${report.report_id}/${filename}`
-
-                // Upload to Supabase Storage
-                const { error: uploadError } = await supabase.storage
-                  .from('expense-receipts')
-                  .upload(receiptPath, receiptBlob, {
-                    contentType: receiptContentType,
-                    upsert: true  // Overwrite if exists (for re-submissions)
-                  })
-
-                if (uploadError) {
-                  console.error(`Receipt upload error for ${expense.expense_id}:`, uploadError)
-                  receiptPath = null  // Clear path if upload failed
-                } else {
-                  console.log(`Receipt uploaded: ${receiptPath}`)
-                }
+              if (uploadError) {
+                console.error(`Receipt upload error for ${expense.expense_id}:`, uploadError)
+                receiptPath = null  // Clear path if upload failed
               } else {
-                const errorText = await receiptResponse.text()
-                console.error(`Failed to download receipt: HTTP ${receiptResponse.status} - ${errorText}`)
+                console.log(`Receipt uploaded: ${receiptPath}`)
               }
+            } else {
+              console.error(`Failed to download receipt: HTTP ${receiptResponse.status}`)
             }
           } catch (receiptError) {
             console.error(`Receipt processing error for ${expense.expense_id}:`, receiptError)
@@ -248,18 +215,27 @@ serve(async (req) => {
             onConflict: 'zoho_expense_id',
             ignoreDuplicates: true  // Don't update if already exists (prevents re-processing)
           })
+          .select('id')
+          .single()
 
         if (insertError) {
-          console.error(`Insert error for ${expense.expense_id}:`, insertError)
-          errors.push(`${expense.expense_id}: ${insertError.message}`)
-          errorCount++
-        } else if (data === null) {
-          // No data returned means it was a duplicate (ignored)
-          console.log(`Expense ${expense.expense_id} already exists, skipped`)
-          skippedCount++
-        } else {
-          console.log(`Expense ${expense.expense_id} inserted successfully`)
+          // Check if it's a duplicate (PGRST116 = no rows returned from single())
+          if (insertError.code === 'PGRST116') {
+            console.log(`Expense ${expense.expense_id} already exists, skipped`)
+            skippedCount++
+          } else {
+            console.error(`Insert error for ${expense.expense_id}:`, insertError)
+            errors.push(`${expense.expense_id}: ${insertError.message}`)
+            errorCount++
+          }
+        } else if (data?.id) {
+          console.log(`Expense ${expense.expense_id} inserted with ID ${data.id}`)
           insertedCount++
+
+          // Queue receipt validation if receipt was uploaded
+          if (receiptPath) {
+            expenseIdsToValidate.push(data.id)
+          }
         }
       } catch (expenseError) {
         console.error(`Error processing expense ${expense.expense_id}:`, expenseError)
@@ -268,8 +244,14 @@ serve(async (req) => {
       }
     }
 
+    // Trigger receipt validations (fire-and-forget, don't block response)
+    for (const expenseId of expenseIdsToValidate) {
+      triggerReceiptValidation(supabaseUrl, expenseId)
+      validationTriggered++
+    }
+
     const duration = Date.now() - startTime
-    console.log(`Completed in ${duration}ms: ${insertedCount} inserted, ${skippedCount} skipped, ${errorCount} errors`)
+    console.log(`Completed in ${duration}ms: ${insertedCount} inserted, ${skippedCount} skipped, ${errorCount} errors, ${validationTriggered} validations triggered`)
 
     // Return success response
     return new Response(
@@ -281,6 +263,7 @@ serve(async (req) => {
         inserted: insertedCount,
         skipped: skippedCount,
         errors: errorCount,
+        validations_triggered: validationTriggered,
         error_details: errors.length > 0 ? errors : undefined,
         duration_ms: duration
       }),

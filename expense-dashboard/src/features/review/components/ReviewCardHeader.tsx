@@ -21,6 +21,7 @@ const TYPE_ICONS = {
   flagged: Flag,
   low_confidence: AlertTriangle,
   processing_error: AlertCircle,
+  stuck: Clock,
 }
 
 export function ReviewCardHeader({ item }: ReviewCardHeaderProps) {

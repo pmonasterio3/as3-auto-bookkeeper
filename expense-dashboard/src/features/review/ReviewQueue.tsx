@@ -110,7 +110,7 @@ export function ReviewQueue() {
   }, [filteredItems, filter])
 
   // Priority order for groups
-  const groupOrder = ['processing_error', 'reimbursement', 'flagged', 'orphan', 'low_confidence']
+  const groupOrder = ['stuck', 'processing_error', 'reimbursement', 'flagged', 'orphan', 'low_confidence']
 
   return (
     <div className="h-full flex flex-col">
@@ -157,6 +157,13 @@ export function ReviewQueue() {
           count={counts.all}
           isActive={filter === 'all'}
           onClick={() => setFilter('all')}
+        />
+        <FilterTab
+          filter="stuck"
+          label="Stuck"
+          count={counts.stuck}
+          isActive={filter === 'stuck'}
+          onClick={() => setFilter('stuck')}
         />
         <FilterTab
           filter="processing_error"

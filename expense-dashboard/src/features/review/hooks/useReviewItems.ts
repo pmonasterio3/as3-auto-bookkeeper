@@ -20,6 +20,7 @@ import { normalizeFlaggedExpense } from '../normalizers/flaggedExpenseNormalizer
 import { normalizeOrphan } from '../normalizers/orphanNormalizer'
 import { normalizeProcessingError } from '../normalizers/processingErrorNormalizer'
 import { normalizeZohoExpense } from '../normalizers/zohoExpenseNormalizer'
+import { normalizeStuckExpense } from '../normalizers/stuckExpenseNormalizer'
 import { ORPHAN_GRACE_DAYS } from '../constants'
 
 interface UseReviewItemsResult {
@@ -31,6 +32,7 @@ interface UseReviewItemsResult {
     flagged: number
     orphan: number
     processing_error: number
+    stuck: number
   }
   isLoading: boolean
   error: string | null
@@ -259,6 +261,47 @@ export function useReviewItems(filter: ReviewFilter = 'all'): UseReviewItemsResu
         }
       }
 
+      // 2.6. Fetch stuck zoho_expenses (status='processing' for > 5 minutes)
+      if (filter === 'all' || filter === 'stuck') {
+        // Calculate 5 minutes ago
+        const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString()
+
+        const { data: stuckData, error: stuckError } = await supabase
+          .from('zoho_expenses')
+          .select('*')
+          .eq('status', 'processing')
+          .lt('processing_started_at', fiveMinutesAgo)
+          .order('processing_started_at', { ascending: true })
+
+        if (stuckError) {
+          console.error('Error fetching stuck zoho_expenses:', stuckError)
+        }
+
+        const stuckExpenses = (stuckData || []) as ZohoExpense[]
+
+        // Fetch report data for each stuck expense
+        const stuckReportIds = [...new Set(stuckExpenses.map((e) => e.zoho_report_id))]
+        let stuckReportsMap = new Map<string, ZohoReportJoin>()
+        if (stuckReportIds.length > 0) {
+          const { data: reportsData } = await supabase
+            .from('zoho_expense_reports')
+            .select('zoho_report_id, submitter_name, submitter_email, approver_name, approver_email, approved_at, submitted_at, report_name, report_number')
+            .in('zoho_report_id', stuckReportIds)
+          if (reportsData) {
+            stuckReportsMap = new Map(reportsData.map((r) => [r.zoho_report_id, r as ZohoReportJoin]))
+          }
+        }
+
+        for (const expense of stuckExpenses) {
+          const reportData = stuckReportsMap.get(expense.zoho_report_id) || null
+          // Calculate stuck duration in minutes
+          const stuckDuration = expense.processing_started_at
+            ? Math.floor((Date.now() - new Date(expense.processing_started_at).getTime()) / (1000 * 60))
+            : 0
+          results.push(normalizeStuckExpense(expense, reportData, stuckDuration))
+        }
+      }
+
       // 3. Fetch orphan bank transactions
       if (filter === 'all' || filter === 'orphan') {
         const graceDaysAgo = new Date(Date.now() - ORPHAN_GRACE_DAYS * 24 * 60 * 60 * 1000)
@@ -333,6 +376,7 @@ export function useReviewItems(filter: ReviewFilter = 'all'): UseReviewItemsResu
     flagged: items.filter((i) => i.itemType === 'flagged').length,
     orphan: items.filter((i) => i.itemType === 'orphan').length,
     processing_error: items.filter((i) => i.itemType === 'processing_error').length,
+    stuck: items.filter((i) => i.itemType === 'stuck').length,
   }
 
   return { items, counts, isLoading, error, refetch: fetchItems }
