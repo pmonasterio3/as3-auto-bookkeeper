@@ -3,16 +3,34 @@
  *
  * Allows users to search unmatched bank transactions by:
  * - Amount (with tolerance)
- * - Date range
+ * - Date range (adjustable)
  * - Vendor/description text
+ *
+ * Features:
+ * - Sort by: Date (newest/oldest), Amount (high/low/closest), Vendor (A-Z/Z-A)
+ * - Adjustable date range with start/end date pickers
+ * - Exact amount match filter toggle
  */
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import { supabase } from '@/lib/supabase'
-import { Search, CreditCard, Check, X, Loader2 } from 'lucide-react'
+import { Search, CreditCard, Check, X, Loader2, ArrowUpDown, Calendar, Filter, ChevronDown, ChevronUp } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { formatCurrency, formatDate } from '@/lib/utils'
 import type { BankTransaction } from '@/types/database'
+
+// Sort options for the transaction list
+type SortOption = 'amount_closest' | 'amount_high' | 'amount_low' | 'date_newest' | 'date_oldest' | 'vendor_az' | 'vendor_za'
+
+const SORT_OPTIONS: { value: SortOption; label: string }[] = [
+  { value: 'amount_closest', label: 'Amount (Closest Match)' },
+  { value: 'date_newest', label: 'Date (Newest First)' },
+  { value: 'date_oldest', label: 'Date (Oldest First)' },
+  { value: 'amount_high', label: 'Amount (High to Low)' },
+  { value: 'amount_low', label: 'Amount (Low to High)' },
+  { value: 'vendor_az', label: 'Vendor (A-Z)' },
+  { value: 'vendor_za', label: 'Vendor (Z-A)' },
+]
 
 interface BankTransactionPickerProps {
   expenseAmount: number
@@ -21,6 +39,11 @@ interface BankTransactionPickerProps {
   currentBankTxnId?: string | null
   onSelect: (txn: BankTransaction | null) => void
   onCancel: () => void
+}
+
+// Helper to format date for input[type="date"]
+function toDateInputValue(date: Date): string {
+  return date.toISOString().split('T')[0]
 }
 
 export function BankTransactionPicker({
@@ -35,60 +58,108 @@ export function BankTransactionPicker({
   const [transactions, setTransactions] = useState<BankTransaction[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [selectedId, setSelectedId] = useState<string | null>(currentBankTxnId || null)
+  const [fetchError, setFetchError] = useState<string | null>(null)
+
+  // Filter & Sort state
+  const [sortBy, setSortBy] = useState<SortOption>('amount_closest')
+  const [showFilters, setShowFilters] = useState(false)
+  const [exactAmountOnly, setExactAmountOnly] = useState(false)
+
+  // Date range state (default: ±7 days from expense date)
+  const [dateStart, setDateStart] = useState(() => {
+    const d = new Date(expenseDate)
+    d.setDate(d.getDate() - 7)
+    return toDateInputValue(d)
+  })
+  const [dateEnd, setDateEnd] = useState(() => {
+    const d = new Date(expenseDate)
+    d.setDate(d.getDate() + 7)
+    return toDateInputValue(d)
+  })
 
   // Fetch candidate bank transactions
   const fetchTransactions = useCallback(async () => {
     setIsLoading(true)
-
-    // Calculate date range (+/- 7 days from expense date)
-    const expDate = new Date(expenseDate)
-    const startDate = new Date(expDate)
-    startDate.setDate(startDate.getDate() - 7)
-    const endDate = new Date(expDate)
-    endDate.setDate(endDate.getDate() + 7)
+    setFetchError(null)
 
     // Query unmatched transactions within date range
-    let query = supabase
+    const { data, error } = await supabase
       .from('bank_transactions')
-      .select('*')
+      .select('id, transaction_date, description, amount, status, source, extracted_vendor')
       .eq('status', 'unmatched')
-      .gte('transaction_date', startDate.toISOString().split('T')[0])
-      .lte('transaction_date', endDate.toISOString().split('T')[0])
+      .gte('transaction_date', dateStart)
+      .lte('transaction_date', dateEnd)
       .order('transaction_date', { ascending: false })
-      .limit(50)
-
-    const { data, error } = await query
+      .limit(100)
 
     if (error) {
       console.error('Error fetching bank transactions:', error)
+      setFetchError('Failed to load transactions. Please try again.')
       setTransactions([])
     } else {
-      // Cast to BankTransaction[] and sort by amount similarity to expense
+      // Cast to BankTransaction[] - we only fetched needed columns
       const txns = (data || []) as BankTransaction[]
-      const sorted = txns.sort((a, b) => {
-        const diffA = Math.abs(a.amount - expenseAmount)
-        const diffB = Math.abs(b.amount - expenseAmount)
-        return diffA - diffB
-      })
-      setTransactions(sorted)
+      setTransactions(txns)
     }
 
     setIsLoading(false)
-  }, [expenseDate, expenseAmount])
+  }, [dateStart, dateEnd])
 
   useEffect(() => {
     fetchTransactions()
   }, [fetchTransactions])
 
-  // Filter transactions by search query
-  const filteredTransactions = transactions.filter((txn) => {
-    if (!searchQuery) return true
-    const query = searchQuery.toLowerCase()
-    return (
-      txn.description.toLowerCase().includes(query) ||
-      (txn.extracted_vendor || '').toLowerCase().includes(query)
-    )
-  })
+  // Filter and sort transactions using useMemo for performance
+  const filteredTransactions = useMemo(() => {
+    let result = [...transactions]
+
+    // Apply text search filter
+    if (searchQuery) {
+      const query = searchQuery.toLowerCase()
+      result = result.filter((txn) =>
+        txn.description.toLowerCase().includes(query) ||
+        (txn.extracted_vendor || '').toLowerCase().includes(query)
+      )
+    }
+
+    // Apply exact amount filter
+    if (exactAmountOnly) {
+      result = result.filter((txn) => Math.abs(txn.amount - expenseAmount) < 0.01)
+    }
+
+    // Apply sorting
+    result.sort((a, b) => {
+      switch (sortBy) {
+        case 'amount_closest': {
+          const diffA = Math.abs(a.amount - expenseAmount)
+          const diffB = Math.abs(b.amount - expenseAmount)
+          return diffA - diffB
+        }
+        case 'amount_high':
+          return b.amount - a.amount
+        case 'amount_low':
+          return a.amount - b.amount
+        case 'date_newest':
+          return new Date(b.transaction_date).getTime() - new Date(a.transaction_date).getTime()
+        case 'date_oldest':
+          return new Date(a.transaction_date).getTime() - new Date(b.transaction_date).getTime()
+        case 'vendor_az': {
+          const vendorA = (a.extracted_vendor || a.description).toLowerCase()
+          const vendorB = (b.extracted_vendor || b.description).toLowerCase()
+          return vendorA.localeCompare(vendorB)
+        }
+        case 'vendor_za': {
+          const vendorA = (a.extracted_vendor || a.description).toLowerCase()
+          const vendorB = (b.extracted_vendor || b.description).toLowerCase()
+          return vendorB.localeCompare(vendorA)
+        }
+        default:
+          return 0
+      }
+    })
+
+    return result
+  }, [transactions, searchQuery, exactAmountOnly, sortBy, expenseAmount])
 
   // Calculate amount difference for display
   const getAmountDiff = (txnAmount: number) => {
@@ -134,22 +205,131 @@ export function BankTransactionPicker({
           </div>
         </div>
 
-        {/* Search */}
-        <div className="px-6 py-4 border-b border-gray-200 bg-gray-50">
-          <div className="relative max-w-xl">
-            <Search className="absolute left-4 top-1/2 -translate-y-1/2 h-5 w-5 text-gray-400" />
-            <input
-              type="text"
-              placeholder="Search by description or vendor..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-12 pr-4 py-3 text-base border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
-              autoFocus
-            />
+        {/* Search & Sort Bar */}
+        <div className="px-6 py-4 border-b border-gray-200 bg-gray-50 space-y-3">
+          {/* Top row: Search + Sort */}
+          <div className="flex flex-col sm:flex-row gap-3">
+            {/* Search input */}
+            <div className="relative flex-1">
+              <Search className="absolute left-4 top-1/2 -translate-y-1/2 h-5 w-5 text-gray-400" />
+              <input
+                type="text"
+                placeholder="Search by description or vendor..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full pl-12 pr-4 py-2.5 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-[#C10230] focus:border-[#C10230] bg-white"
+                autoFocus
+              />
+            </div>
+
+            {/* Sort dropdown */}
+            <div className="flex items-center gap-2">
+              <ArrowUpDown className="h-4 w-4 text-gray-500 flex-shrink-0" />
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as SortOption)}
+                className="px-3 py-2.5 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-[#C10230] focus:border-[#C10230] bg-white min-w-[180px]"
+              >
+                {SORT_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Filter toggle button */}
+            <button
+              onClick={() => setShowFilters(!showFilters)}
+              className={cn(
+                "flex items-center gap-2 px-4 py-2.5 text-sm font-medium rounded-lg border transition-colors",
+                showFilters
+                  ? "bg-blue-50 border-blue-300 text-blue-700"
+                  : "bg-white border-gray-300 text-gray-700 hover:bg-gray-50"
+              )}
+            >
+              <Filter className="h-4 w-4" />
+              Filters
+              {showFilters ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+            </button>
           </div>
-          <p className="text-xs text-gray-500 mt-2">
-            Showing unmatched transactions within ±7 days of expense date • {filteredTransactions.length} results
-          </p>
+
+          {/* Expandable filters panel */}
+          {showFilters && (
+            <div className="p-4 bg-white rounded-lg border border-gray-200 space-y-4">
+              {/* Date range row */}
+              <div className="flex flex-wrap items-end gap-4">
+                <div className="flex items-center gap-2">
+                  <Calendar className="h-4 w-4 text-gray-500" />
+                  <span className="text-sm font-medium text-gray-700">Date Range:</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <label className="text-xs text-gray-500">From</label>
+                  <input
+                    type="date"
+                    value={dateStart}
+                    onChange={(e) => setDateStart(e.target.value)}
+                    className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-[#C10230] focus:border-[#C10230] bg-white"
+                  />
+                </div>
+                <div className="flex items-center gap-2">
+                  <label className="text-xs text-gray-500">To</label>
+                  <input
+                    type="date"
+                    value={dateEnd}
+                    onChange={(e) => setDateEnd(e.target.value)}
+                    className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-[#C10230] focus:border-[#C10230] bg-white"
+                  />
+                </div>
+                <button
+                  onClick={() => {
+                    const d = new Date(expenseDate)
+                    const start = new Date(d)
+                    start.setDate(start.getDate() - 7)
+                    const end = new Date(d)
+                    end.setDate(end.getDate() + 7)
+                    setDateStart(toDateInputValue(start))
+                    setDateEnd(toDateInputValue(end))
+                  }}
+                  className="text-xs text-blue-600 hover:text-blue-800 hover:underline"
+                >
+                  Reset to ±7 days
+                </button>
+              </div>
+
+              {/* Amount filter row */}
+              <div className="flex flex-wrap items-center gap-4">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={exactAmountOnly}
+                    onChange={(e) => setExactAmountOnly(e.target.checked)}
+                    className="h-4 w-4 rounded border-gray-300 text-[#C10230] focus:ring-[#C10230]"
+                  />
+                  <span className="text-sm text-gray-700">
+                    Exact amount matches only ({formatCurrency(expenseAmount)})
+                  </span>
+                </label>
+              </div>
+            </div>
+          )}
+
+          {/* Results summary */}
+          <div className="flex items-center justify-between text-xs text-gray-500">
+            <span>
+              {filteredTransactions.length} transactions found
+              {dateStart && dateEnd && ` (${formatDate(dateStart)} – ${formatDate(dateEnd)})`}
+            </span>
+            {(exactAmountOnly || searchQuery) && (
+              <button
+                onClick={() => {
+                  setSearchQuery('')
+                  setExactAmountOnly(false)
+                }}
+                className="text-blue-600 hover:text-blue-800 hover:underline"
+              >
+                Clear filters
+              </button>
+            )}
+          </div>
         </div>
 
         {/* Transaction List */}
@@ -159,11 +339,37 @@ export function BankTransactionPicker({
               <Loader2 className="h-8 w-8 animate-spin text-blue-500" />
               <span className="ml-3 text-lg text-gray-500">Loading transactions...</span>
             </div>
+          ) : fetchError ? (
+            <div className="py-16 text-center">
+              <X className="h-12 w-12 text-red-300 mx-auto mb-3" />
+              <p className="text-lg text-red-600">{fetchError}</p>
+              <button
+                onClick={fetchTransactions}
+                className="mt-4 px-4 py-2 text-sm font-medium text-blue-600 hover:text-blue-800 hover:underline"
+              >
+                Try again
+              </button>
+            </div>
           ) : filteredTransactions.length === 0 ? (
             <div className="py-16 text-center">
               <CreditCard className="h-12 w-12 text-gray-300 mx-auto mb-3" />
               <p className="text-lg text-gray-500">No matching transactions found</p>
-              <p className="text-sm text-gray-400 mt-1">Try adjusting your search or check different date ranges</p>
+              <p className="text-sm text-gray-400 mt-1">
+                {searchQuery || exactAmountOnly
+                  ? 'Try adjusting your search or filters'
+                  : 'Try expanding the date range using the Filters button'}
+              </p>
+              {(searchQuery || exactAmountOnly) && (
+                <button
+                  onClick={() => {
+                    setSearchQuery('')
+                    setExactAmountOnly(false)
+                  }}
+                  className="mt-4 px-4 py-2 text-sm font-medium text-blue-600 hover:text-blue-800 hover:underline"
+                >
+                  Clear all filters
+                </button>
+              )}
             </div>
           ) : (
             <div className="divide-y divide-gray-100">

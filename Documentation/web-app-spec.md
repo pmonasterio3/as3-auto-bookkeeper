@@ -1,7 +1,7 @@
 # AS3 Expense Automation - Web Application Specification
 
-**Version:** 1.2
-**Last Updated:** December 15, 2025
+**Version:** 1.3
+**Last Updated:** December 26, 2025
 **Technology Stack:** React 18 + Vite + Tailwind CSS + Supabase
 
 ---
@@ -94,12 +94,12 @@ expense-dashboard/
 │   │   │   └── ReceiptViewer.tsx   # Receipt image viewer
 │   │   │
 │   │   ├── review/
-│   │   │   ├── ReviewQueue.tsx     # Queue list
-│   │   │   ├── ReviewCard.tsx      # Individual review card
-│   │   │   ├── MatchSelector.tsx   # Bank transaction matcher
-│   │   │   ├── CategoryPicker.tsx  # Category selection
-│   │   │   ├── StatePicker.tsx     # State selection
-│   │   │   └── ApprovalActions.tsx # Approve/Correct/Reject buttons
+│   │   │   ├── ReviewQueue.tsx           # Queue list
+│   │   │   ├── ReviewCard.tsx            # Individual review card
+│   │   │   ├── BankTransactionPicker.tsx # Enhanced bank transaction matcher with filters/sort
+│   │   │   ├── CategoryPicker.tsx        # Category selection
+│   │   │   ├── StatePicker.tsx           # State selection
+│   │   │   └── ApprovalActions.tsx       # Approve/Correct/Reject buttons
 │   │   │
 │   │   ├── bank/
 │   │   │   ├── TransactionList.tsx # Bank transaction table
@@ -631,6 +631,34 @@ interface Corrections {
     notes?: string;
 }
 ```
+
+### BankTransactionPicker Component
+
+**Full Documentation:** See `Documentation/Technical_Docs/BANK_TRANSACTION_PICKER.md` for comprehensive details.
+
+**Summary:** Modal component for searching, filtering, and selecting bank transactions during manual expense matching. Features advanced filtering (date range, exact amount), sorting (7 options), and real-time search.
+
+```typescript
+// src/features/review/components/BankTransactionPicker.tsx
+
+interface BankTransactionPickerProps {
+    expenseAmount: number;           // For amount comparison and sorting
+    expenseDate: string;             // For default date range calculation
+    expenseVendor: string;           // Displayed in modal header
+    currentBankTxnId?: string | null; // Pre-selected transaction (if any)
+    onSelect: (txn: BankTransaction | null) => void; // Selection callback
+    onCancel: () => void;            // Cancel callback
+}
+```
+
+**Key Features:**
+- **Sorting:** Amount (closest), Date (newest/oldest), Amount (high/low), Vendor (A-Z/Z-A)
+- **Filters:** Date range (adjustable, default ±7 days), Exact amount match, Text search
+- **Visual Indicators:** Exact match badges, amount difference display, source badges
+- **Performance:** Uses explicit column selection, useMemo for filtering/sorting
+- **Error Handling:** Retry button on fetch errors, clear empty state messaging
+
+**Integration:** Used in ReviewDetailPanel for flagged expenses needing manual bank transaction matching.
 
 ### CSVUploader Component
 
