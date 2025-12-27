@@ -10,7 +10,7 @@
  * - Inline editing for category/state/vendor
  */
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import {
   Sheet,
   SheetHeader,
@@ -20,7 +20,6 @@ import {
 import { Button } from '@/components/ui/Button'
 import { supabase } from '@/lib/supabase'
 import {
-  ExternalLink,
   CreditCard,
   Check,
   X,
@@ -34,7 +33,11 @@ import {
   Clock,
   Search,
   Link,
-  Trash2
+  Trash2,
+  Expand,
+  ZoomIn,
+  ZoomOut,
+  RotateCcw
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { formatCurrency, formatDate, formatRelativeTime } from '@/lib/utils'
@@ -79,6 +82,10 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
   const [showBankPicker, setShowBankPicker] = useState(false)
   const [selectedBankTxn, setSelectedBankTxn] = useState<BankTransaction | null>(null)
 
+  // Receipt overlay state
+  const [showReceiptOverlay, setShowReceiptOverlay] = useState(false)
+  const [receiptZoom, setReceiptZoom] = useState(1)
+
   useEffect(() => {
     if (!item) return
 
@@ -91,6 +98,8 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
     setActionError(null)
     setShowBankPicker(false)
     setSelectedBankTxn(null)
+    setShowReceiptOverlay(false)
+    setReceiptZoom(1)
 
     async function fetchData() {
       const [accountsRes, classesRes] = await Promise.all([
@@ -102,6 +111,24 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
     }
     fetchData()
   }, [item])
+
+  // Receipt overlay handlers (must be before early return)
+  const closeReceiptOverlay = useCallback(() => {
+    setShowReceiptOverlay(false)
+    setReceiptZoom(1)
+  }, [])
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && showReceiptOverlay) {
+        closeReceiptOverlay()
+      }
+    }
+    if (showReceiptOverlay) {
+      document.addEventListener('keydown', handleKeyDown)
+      return () => document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [showReceiptOverlay, closeReceiptOverlay])
 
   if (!item) return null
 
@@ -491,7 +518,11 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
             </div>
             {item.receipt?.url ? (
               <div className="flex-1 flex flex-col min-h-0">
-                <div className="flex-1 bg-white rounded-lg border border-gray-200 overflow-hidden relative min-h-[240px]">
+                <div
+                  className="flex-1 bg-white rounded-lg border border-gray-200 overflow-hidden relative min-h-[240px] cursor-pointer hover:border-[#C10230] transition-colors"
+                  onClick={() => setShowReceiptOverlay(true)}
+                  title="Click to view full size"
+                >
                   <img
                     src={item.receipt.url}
                     alt="Receipt"
@@ -509,15 +540,13 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
                     </div>
                   </div>
                 </div>
-                <a
-                  href={item.receipt.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="mt-2 flex items-center justify-center gap-1.5 text-xs font-medium text-[#C10230] hover:underline"
+                <button
+                  onClick={() => setShowReceiptOverlay(true)}
+                  className="mt-2 flex items-center justify-center gap-1.5 text-xs font-medium text-[#C10230] hover:underline w-full"
                 >
-                  <ExternalLink className="h-3.5 w-3.5" />
+                  <Expand className="h-3.5 w-3.5" />
                   Open full size
-                </a>
+                </button>
               </div>
             ) : (
               <div className="flex-1 flex items-center justify-center bg-gray-100 rounded-lg border border-gray-200 min-h-[240px]">
@@ -618,6 +647,70 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
           </>
         )}
       </SheetFooter>
+
+      {/* Receipt Full Size Overlay */}
+      {showReceiptOverlay && item.receipt?.url && (
+        <div
+          className="fixed inset-0 z-[100] bg-black/80 flex items-center justify-center"
+          onClick={closeReceiptOverlay}
+        >
+          {/* Controls Bar */}
+          <div className="absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-white/90 backdrop-blur-sm rounded-lg px-3 py-2 shadow-lg z-10">
+            <button
+              onClick={(e) => { e.stopPropagation(); setReceiptZoom(z => Math.max(0.25, z - 0.25)) }}
+              className="p-1.5 hover:bg-gray-100 rounded transition-colors"
+              title="Zoom out"
+            >
+              <ZoomOut className="h-5 w-5 text-gray-700" />
+            </button>
+            <span className="text-sm font-medium text-gray-700 min-w-[4rem] text-center">
+              {Math.round(receiptZoom * 100)}%
+            </span>
+            <button
+              onClick={(e) => { e.stopPropagation(); setReceiptZoom(z => Math.min(4, z + 0.25)) }}
+              className="p-1.5 hover:bg-gray-100 rounded transition-colors"
+              title="Zoom in"
+            >
+              <ZoomIn className="h-5 w-5 text-gray-700" />
+            </button>
+            <div className="w-px h-5 bg-gray-300 mx-1" />
+            <button
+              onClick={(e) => { e.stopPropagation(); setReceiptZoom(1) }}
+              className="p-1.5 hover:bg-gray-100 rounded transition-colors"
+              title="Reset zoom"
+            >
+              <RotateCcw className="h-5 w-5 text-gray-700" />
+            </button>
+          </div>
+
+          {/* Close Button */}
+          <button
+            onClick={closeReceiptOverlay}
+            className="absolute top-4 right-4 p-2 bg-white/90 backdrop-blur-sm rounded-lg hover:bg-white shadow-lg transition-colors z-10"
+            title="Close (Esc)"
+          >
+            <X className="h-6 w-6 text-gray-700" />
+          </button>
+
+          {/* Image Container */}
+          <div
+            className="max-w-[90vw] max-h-[90vh] overflow-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <img
+              src={item.receipt.url}
+              alt="Receipt full size"
+              className="transition-transform duration-200"
+              style={{ transform: `scale(${receiptZoom})`, transformOrigin: 'center center' }}
+            />
+          </div>
+
+          {/* Hint */}
+          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 text-white/70 text-xs">
+            Press Esc or click outside to close
+          </div>
+        </div>
+      )}
     </Sheet>
   )
 }
