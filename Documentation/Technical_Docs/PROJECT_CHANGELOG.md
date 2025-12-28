@@ -4,6 +4,56 @@
 
 ---
 
+## December 28, 2025: Human Approved Processor Query Vendor Fix
+
+**STATUS:** ✅ FIXED - Query Vendor node now correctly references Edit Fields node.
+
+**Problem:**
+- Human Approved Processor workflow failing with QBO API errors
+- Error: `"Error parsing query - Encountered " "=" "= "" at line 1, column 1"`
+- Also: `"Referenced node doesn't exist"`
+
+**Root Cause:**
+
+The Query Vendor node had THREE bugs from incorrect copy-paste from Agent 1:
+
+```javascript
+// BROKEN configuration
+"==SELECT * FROM Vendor WHERE DisplayName = '{{ $('Parse AI Decision').first().json.merchant_name_for_qbo... }}'"
+```
+
+| Bug | Problem | Impact |
+|-----|---------|--------|
+| `==SELECT` | Double equals prefix | Sent literally to QBO API |
+| `$('Parse AI Decision')` | Node doesn't exist in Human Approved | "Referenced node doesn't exist" |
+| `merchant_name_for_qbo` | Field doesn't exist in Edit Fields | Returns undefined |
+
+**The Fix:**
+
+```javascript
+// CORRECT configuration
+"=SELECT * FROM Vendor WHERE DisplayName LIKE '%{{ $('Edit Fields').first().json.vendor_clean.replace(/['\"\\']/g, '') }}%'"
+```
+
+**Key Changes:**
+- Single `=` prefix (expression mode, not literal)
+- Reference `$('Edit Fields')` (exists in this workflow)
+- Use `vendor_clean` field (extracted from webhook)
+- `LIKE '%...%'` for fuzzy matching
+
+**Workflow Architecture Difference:**
+
+| Workflow | Has Parse AI Decision? | Vendor Source |
+|----------|------------------------|---------------|
+| Agent 1 - Queue Based v3.0 | YES | `merchant_name_for_qbo` from AI |
+| Human Approved Processor | NO | `vendor_clean` from webhook |
+
+**Key Lesson:** When maintaining parallel workflows with similar logic, always verify node references are workflow-specific. Human Approved Processor bypasses AI entirely - it receives pre-approved expenses from the Review Queue UI.
+
+**Documentation:** See `N8N_HUMAN_APPROVED_PROCESSOR_FIX.md` for full details.
+
+---
+
 ## December 28, 2025: Lookup QBO Class Node Fix (Agent 1)
 
 **STATUS:** ✅ FIXED - State lookup now uses abbreviation from Edit Fields node.
