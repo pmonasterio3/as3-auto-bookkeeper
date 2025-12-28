@@ -276,15 +276,44 @@ Only output valid JSON, no other text.`
       throw new Error(`Failed to store validation: ${insertError.message}`)
     }
 
-    // Update expense with validation result
+    // Build expense update object
+    const expenseUpdates: Record<string, unknown> = {
+      receipt_validated: true,
+      receipt_validation_id: validationData.id,
+      vendor_clean: validation.merchant_extracted,
+      updated_at: new Date().toISOString()
+    }
+
+    // AUTO-CORRECT AMOUNT: If receipt shows different amount with high confidence, fix it
+    // This ensures bank matching has the correct amount to work with
+    let amountCorrected = false
+    const originalAmount = expense.amount
+    if (
+      !validation.amounts_match &&
+      validation.amount_extracted !== null &&
+      validation.confidence >= 70 &&
+      Math.abs(validation.amount_extracted - expense.amount) > 0.01
+    ) {
+      expenseUpdates.amount = validation.amount_extracted
+      expenseUpdates.original_amount = originalAmount  // Preserve original for audit
+      amountCorrected = true
+      console.log(`Amount auto-corrected: $${originalAmount} → $${validation.amount_extracted}`)
+
+      // Add correction note to issues
+      const correctionNote = `Amount auto-corrected from $${originalAmount} to $${validation.amount_extracted} based on receipt`
+      validation.issues = [...(validation.issues || []), correctionNote]
+
+      // Update the validation record with the correction note
+      await supabase
+        .from('receipt_validations')
+        .update({ issues: validation.issues })
+        .eq('id', validationData.id)
+    }
+
+    // Update expense with validation result (and corrected amount if applicable)
     const { error: updateError } = await supabase
       .from('zoho_expenses')
-      .update({
-        receipt_validated: true,
-        receipt_validation_id: validationData.id,
-        vendor_clean: validation.merchant_extracted,
-        updated_at: new Date().toISOString()
-      })
+      .update(expenseUpdates)
       .eq('id', expense.id)
 
     if (updateError) {
@@ -292,7 +321,7 @@ Only output valid JSON, no other text.`
     }
 
     const duration = Date.now() - startTime
-    console.log(`Validation complete in ${duration}ms: confidence=${validation.confidence}%`)
+    console.log(`Validation complete in ${duration}ms: confidence=${validation.confidence}%${amountCorrected ? ' (amount corrected)' : ''}`)
 
     return new Response(
       JSON.stringify({
@@ -307,6 +336,9 @@ Only output valid JSON, no other text.`
           confidence: validation.confidence,
           issues: validation.issues
         },
+        amount_corrected: amountCorrected,
+        original_amount: amountCorrected ? originalAmount : undefined,
+        new_amount: amountCorrected ? validation.amount_extracted : undefined,
         duration_ms: duration
       }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }

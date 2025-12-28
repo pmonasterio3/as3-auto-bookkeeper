@@ -2,7 +2,14 @@
 
 **Version:** 1.0
 **Created:** December 22, 2025
-**Purpose:** Remove AI receipt validation from n8n (now handled by Edge Function)
+**Status:** ⚠️ OBSOLETE - SUPERSEDED BY N8N_AI_RECEIPT_TOOL_FIX.md ⚠️
+
+> **DO NOT USE THIS APPROACH.** Removing AI receipt validation was a mistake.
+> The AI Agent's core purpose IS to analyze receipts and make intelligent decisions.
+> See `N8N_AI_RECEIPT_TOOL_FIX.md` for the correct architecture that preserves AI capabilities
+> while eliminating memory issues through tool-based receipt fetching.
+
+**Original Purpose:** Remove AI receipt validation from n8n (now handled by Edge Function)
 
 ---
 
