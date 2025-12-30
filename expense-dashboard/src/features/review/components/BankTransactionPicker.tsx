@@ -65,6 +65,9 @@ export function BankTransactionPicker({
   const [showFilters, setShowFilters] = useState(false)
   const [exactAmountOnly, setExactAmountOnly] = useState(false)
 
+  // Date filter enabled state - when false, shows ALL unmatched transactions
+  const [useDateFilter, setUseDateFilter] = useState(true)
+
   // Date range state (default: ±7 days from expense date)
   const [dateStart, setDateStart] = useState(() => {
     const d = new Date(expenseDate)
@@ -78,19 +81,59 @@ export function BankTransactionPicker({
   })
 
   // Fetch candidate bank transactions
+  // IMPORTANT: Sort is applied at DB level to ensure limit doesn't cut off wrong records
   const fetchTransactions = useCallback(async () => {
     setIsLoading(true)
     setFetchError(null)
 
-    // Query unmatched transactions within date range
-    const { data, error } = await supabase
+    // Build query - conditionally apply date filter
+    let query = supabase
       .from('bank_transactions')
       .select('id, transaction_date, description, amount, status, source, extracted_vendor')
       .eq('status', 'unmatched')
-      .gte('transaction_date', dateStart)
-      .lte('transaction_date', dateEnd)
-      .order('transaction_date', { ascending: false })
-      .limit(100)
+
+    // Only apply date constraints when filter is enabled
+    if (useDateFilter) {
+      query = query
+        .gte('transaction_date', dateStart)
+        .lte('transaction_date', dateEnd)
+    }
+
+    // Apply DB-level ordering based on sort preference
+    // This ensures the LIMIT doesn't cut off the wrong end of results
+    switch (sortBy) {
+      case 'date_oldest':
+        query = query.order('transaction_date', { ascending: true })
+        break
+      case 'date_newest':
+        query = query.order('transaction_date', { ascending: false })
+        break
+      case 'amount_high':
+        query = query.order('amount', { ascending: false })
+        break
+      case 'amount_low':
+        query = query.order('amount', { ascending: true })
+        break
+      case 'vendor_az':
+        query = query.order('extracted_vendor', { ascending: true, nullsFirst: false })
+        break
+      case 'vendor_za':
+        query = query.order('extracted_vendor', { ascending: false, nullsFirst: true })
+        break
+      case 'amount_closest':
+      default:
+        // For amount_closest, we need all data to calculate - use date as secondary sort
+        // Fetch more records when using this sort since we need client-side calculation
+        query = query.order('transaction_date', { ascending: false })
+        break
+    }
+
+    // When date filter is ON: no limit needed (date range constrains data)
+    // When date filter is OFF: use limit to prevent huge fetches
+    // When using amount_closest: fetch more to ensure we find the closest match
+    const limit = useDateFilter ? 1000 : (sortBy === 'amount_closest' ? 500 : 500)
+
+    const { data, error } = await query.limit(limit)
 
     if (error) {
       console.error('Error fetching bank transactions:', error)
@@ -103,7 +146,7 @@ export function BankTransactionPicker({
     }
 
     setIsLoading(false)
-  }, [dateStart, dateEnd])
+  }, [useDateFilter, dateStart, dateEnd, sortBy])
 
   useEffect(() => {
     fetchTransactions()
@@ -255,44 +298,64 @@ export function BankTransactionPicker({
           {/* Expandable filters panel */}
           {showFilters && (
             <div className="p-4 bg-white rounded-lg border border-gray-200 space-y-4">
-              {/* Date range row */}
+              {/* Date filter toggle + range row */}
               <div className="flex flex-wrap items-end gap-4">
-                <div className="flex items-center gap-2">
+                {/* Date filter enable/disable toggle */}
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={useDateFilter}
+                    onChange={(e) => setUseDateFilter(e.target.checked)}
+                    className="h-4 w-4 rounded border-gray-300 text-[#C10230] focus:ring-[#C10230]"
+                  />
                   <Calendar className="h-4 w-4 text-gray-500" />
-                  <span className="text-sm font-medium text-gray-700">Date Range:</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <label className="text-xs text-gray-500">From</label>
-                  <input
-                    type="date"
-                    value={dateStart}
-                    onChange={(e) => setDateStart(e.target.value)}
-                    className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-[#C10230] focus:border-[#C10230] bg-white"
-                  />
-                </div>
-                <div className="flex items-center gap-2">
-                  <label className="text-xs text-gray-500">To</label>
-                  <input
-                    type="date"
-                    value={dateEnd}
-                    onChange={(e) => setDateEnd(e.target.value)}
-                    className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-[#C10230] focus:border-[#C10230] bg-white"
-                  />
-                </div>
-                <button
-                  onClick={() => {
-                    const d = new Date(expenseDate)
-                    const start = new Date(d)
-                    start.setDate(start.getDate() - 7)
-                    const end = new Date(d)
-                    end.setDate(end.getDate() + 7)
-                    setDateStart(toDateInputValue(start))
-                    setDateEnd(toDateInputValue(end))
-                  }}
-                  className="text-xs text-blue-600 hover:text-blue-800 hover:underline"
-                >
-                  Reset to ±7 days
-                </button>
+                  <span className="text-sm font-medium text-gray-700">Filter by date</span>
+                </label>
+
+                {/* Date inputs - only enabled when date filter is on */}
+                {useDateFilter && (
+                  <>
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs text-gray-500">From</label>
+                      <input
+                        type="date"
+                        value={dateStart}
+                        onChange={(e) => setDateStart(e.target.value)}
+                        className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-[#C10230] focus:border-[#C10230] bg-white"
+                      />
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs text-gray-500">To</label>
+                      <input
+                        type="date"
+                        value={dateEnd}
+                        onChange={(e) => setDateEnd(e.target.value)}
+                        className="px-3 py-1.5 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-[#C10230] focus:border-[#C10230] bg-white"
+                      />
+                    </div>
+                    <button
+                      onClick={() => {
+                        const d = new Date(expenseDate)
+                        const start = new Date(d)
+                        start.setDate(start.getDate() - 7)
+                        const end = new Date(d)
+                        end.setDate(end.getDate() + 7)
+                        setDateStart(toDateInputValue(start))
+                        setDateEnd(toDateInputValue(end))
+                      }}
+                      className="text-xs text-blue-600 hover:text-blue-800 hover:underline"
+                    >
+                      Reset to ±7 days
+                    </button>
+                  </>
+                )}
+
+                {/* Show info when date filter is off */}
+                {!useDateFilter && (
+                  <span className="text-xs text-amber-600 font-medium">
+                    Showing all unmatched transactions (up to 500)
+                  </span>
+                )}
               </div>
 
               {/* Amount filter row */}
@@ -316,17 +379,28 @@ export function BankTransactionPicker({
           <div className="flex items-center justify-between text-xs text-gray-500">
             <span>
               {filteredTransactions.length} transactions found
-              {dateStart && dateEnd && ` (${formatDate(dateStart)} – ${formatDate(dateEnd)})`}
+              {useDateFilter && dateStart && dateEnd
+                ? ` (${formatDate(dateStart)} – ${formatDate(dateEnd)})`
+                : ' (all dates)'}
             </span>
-            {(exactAmountOnly || searchQuery) && (
+            {(exactAmountOnly || searchQuery || !useDateFilter) && (
               <button
                 onClick={() => {
                   setSearchQuery('')
                   setExactAmountOnly(false)
+                  setUseDateFilter(true)
+                  // Reset dates to default ±7 days
+                  const d = new Date(expenseDate)
+                  const start = new Date(d)
+                  start.setDate(start.getDate() - 7)
+                  const end = new Date(d)
+                  end.setDate(end.getDate() + 7)
+                  setDateStart(toDateInputValue(start))
+                  setDateEnd(toDateInputValue(end))
                 }}
                 className="text-blue-600 hover:text-blue-800 hover:underline"
               >
-                Clear filters
+                Reset all filters
               </button>
             )}
           </div>
@@ -357,17 +431,22 @@ export function BankTransactionPicker({
               <p className="text-sm text-gray-400 mt-1">
                 {searchQuery || exactAmountOnly
                   ? 'Try adjusting your search or filters'
-                  : 'Try expanding the date range using the Filters button'}
+                  : useDateFilter
+                    ? 'Try disabling the date filter or expanding the date range'
+                    : 'No unmatched transactions available'}
               </p>
-              {(searchQuery || exactAmountOnly) && (
+              {(searchQuery || exactAmountOnly || useDateFilter) && (
                 <button
                   onClick={() => {
                     setSearchQuery('')
                     setExactAmountOnly(false)
+                    if (useDateFilter) {
+                      setUseDateFilter(false)
+                    }
                   }}
                   className="mt-4 px-4 py-2 text-sm font-medium text-blue-600 hover:text-blue-800 hover:underline"
                 >
-                  Clear all filters
+                  {useDateFilter ? 'Show all dates' : 'Clear filters'}
                 </button>
               )}
             </div>
