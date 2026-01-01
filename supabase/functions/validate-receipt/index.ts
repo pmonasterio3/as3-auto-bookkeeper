@@ -310,6 +310,40 @@ Only output valid JSON, no other text.`
         .eq('id', validationData.id)
     }
 
+    // AUTO-CORRECT DATE: If receipt shows different date with high confidence, fix it
+    // This handles date format inversions (e.g., 11/09 interpreted as Sept 11 instead of Nov 9)
+    let dateCorrected = false
+    const originalDate = expense.expense_date
+    if (
+      validation.date_extracted !== null &&
+      validation.confidence >= 70 &&
+      originalDate !== validation.date_extracted
+    ) {
+      // Check if dates differ by more than 1 day (allowing for timezone issues)
+      const expenseDate = new Date(originalDate)
+      const receiptDate = new Date(validation.date_extracted)
+      const daysDiff = Math.abs((receiptDate.getTime() - expenseDate.getTime()) / (1000 * 60 * 60 * 24))
+
+      // Only auto-correct if dates differ significantly (> 1 day)
+      // This catches DD/MM vs MM/DD inversions which typically differ by weeks/months
+      if (daysDiff > 1) {
+        expenseUpdates.expense_date = validation.date_extracted
+        expenseUpdates.original_expense_date = originalDate  // Preserve original for audit
+        dateCorrected = true
+        console.log(`Date auto-corrected: ${originalDate} → ${validation.date_extracted} (${daysDiff.toFixed(0)} days difference)`)
+
+        // Add correction note to issues
+        const dateCorrectionNote = `Date auto-corrected from ${originalDate} to ${validation.date_extracted} based on receipt (likely DD/MM vs MM/DD format issue)`
+        validation.issues = [...(validation.issues || []), dateCorrectionNote]
+
+        // Update the validation record with the correction note
+        await supabase
+          .from('receipt_validations')
+          .update({ issues: validation.issues })
+          .eq('id', validationData.id)
+      }
+    }
+
     // Update expense with validation result (and corrected amount if applicable)
     const { error: updateError } = await supabase
       .from('zoho_expenses')
@@ -321,7 +355,11 @@ Only output valid JSON, no other text.`
     }
 
     const duration = Date.now() - startTime
-    console.log(`Validation complete in ${duration}ms: confidence=${validation.confidence}%${amountCorrected ? ' (amount corrected)' : ''}`)
+    const corrections = [
+      amountCorrected ? 'amount corrected' : null,
+      dateCorrected ? 'date corrected' : null
+    ].filter(Boolean).join(', ')
+    console.log(`Validation complete in ${duration}ms: confidence=${validation.confidence}%${corrections ? ` (${corrections})` : ''}`)
 
     return new Response(
       JSON.stringify({
@@ -331,6 +369,7 @@ Only output valid JSON, no other text.`
         validation: {
           merchant_extracted: validation.merchant_extracted,
           amount_extracted: validation.amount_extracted,
+          date_extracted: validation.date_extracted,
           amounts_match: validation.amounts_match,
           merchant_match: validation.merchant_match,
           confidence: validation.confidence,
@@ -339,6 +378,9 @@ Only output valid JSON, no other text.`
         amount_corrected: amountCorrected,
         original_amount: amountCorrected ? originalAmount : undefined,
         new_amount: amountCorrected ? validation.amount_extracted : undefined,
+        date_corrected: dateCorrected,
+        original_date: dateCorrected ? originalDate : undefined,
+        new_date: dateCorrected ? validation.date_extracted : undefined,
         duration_ms: duration
       }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
