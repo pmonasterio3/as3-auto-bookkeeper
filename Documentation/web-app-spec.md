@@ -1,7 +1,7 @@
 # AS3 Expense Automation - Web Application Specification
 
-**Version:** 1.3
-**Last Updated:** December 26, 2025
+**Version:** 1.5
+**Last Updated:** December 29, 2025
 **Technology Stack:** React 18 + Vite + Tailwind CSS + Supabase
 
 ---
@@ -198,6 +198,7 @@ const routes = [
     { path: '/review', element: <ReviewQueue />, protected: true },
     { path: '/orphans', element: <OrphanQueue />, protected: true },
     { path: '/reimbursements', element: <ReimbursementQueue />, protected: true },
+    { path: '/match-history', element: <MatchHistoryPage />, protected: true, roles: ['admin', 'bookkeeper'] },
     { path: '/import', element: <BankImport />, protected: true },
     { path: '/transactions', element: <BankTransactions />, protected: true },
     { path: '/vendors', element: <VendorRules />, protected: true },
@@ -327,9 +328,14 @@ For items from the `zoho_expenses` table (flagged during queue processing):
 
 - **Match Confidence Display:** Visual progress bar showing confidence percentage (green ≥95%, amber ≥70%, red <70%)
 - **Processing Attempts:** Counter shown when item has been retried more than once
+- **Editable Fields:**
+  - **Date:** HTML date picker (YYYY-MM-DD format) for correcting expense dates
+  - **State:** Dropdown with all 8 state options
+  - **Category:** Dropdown with QBO account options
+  - **Bank Transaction:** "Change" link to select different bank transaction match
 - **Available Actions:**
   - **Approve:** If no changes needed, mark as approved (status → 'posted')
-  - **Save & Resubmit:** Apply corrections (state_tag, category_name) and reset status → 'pending' for reprocessing
+  - **Save & Resubmit:** Apply corrections (date, state_tag, category_name) and reset status → 'pending' for reprocessing
   - **Resubmit:** Reset status → 'pending' without changes to retry processing
   - **Reject:** Mark as rejected (status → 'rejected')
   - **Create Vendor Rule:** Optionally create vendor rule from corrections
@@ -337,12 +343,163 @@ For items from the `zoho_expenses` table (flagged during queue processing):
 **Receipt Display:** Receipts stored in Supabase Storage bucket `expense-receipts` are displayed via signed URLs (1-hour expiry).
 
 **Resubmit Flow:**
-1. User corrects state/category in UI
-2. Clicks "Save & Resubmit"
-3. Updates zoho_expenses row with corrections
-4. Resets status to 'pending', clears processing_started_at and last_error
-5. Queue controller picks up expense for reprocessing
-6. n8n applies corrected values during processing
+1. User corrects date/state/category in UI
+2. Optionally changes bank transaction match using "Change" link
+3. Clicks "Save & Resubmit"
+4. Updates zoho_expenses row with corrections:
+   - `expense_date` = corrected date (if changed)
+   - `state_tag` = corrected state (if changed)
+   - `category_name` = corrected category (if changed)
+   - `bank_transaction_id` = new match (if changed)
+   - `corrections` JSONB field updated with audit trail
+5. Updates bank_transactions table if match was changed
+6. Resets status to 'pending', clears processing_started_at and last_error
+7. Queue controller picks up expense for reprocessing
+8. n8n applies corrected values during processing (including corrected date)
+
+**Why Date Editing Matters:**
+- Bank transaction matching uses ±3 day window from expense_date
+- Monday.com event matching checks date range overlap with expense_date
+- QBO Purchase transactions must have accurate dates for accounting
+- Incorrect dates cause legitimate matches to fail, flagging valid expenses
+
+**Bank Transaction Editing:**
+- Flagged expenses with existing bank match show matched transaction with green highlight
+- "Change" link allows selecting a different bank transaction
+- Clicking "Change" opens BankTransactionPicker component
+- User can search/filter/sort unmatched transactions within ±7 days
+- Selecting new transaction updates both zoho_expenses and bank_transactions tables
+- Users can also change state/category WITHOUT changing bank transaction (existing match preserved)
+
+---
+
+#### Match History (`/match-history`)
+
+**Purpose:** Review and edit recently posted expenses that have already been processed to QBO
+
+**Access:** Admin and Bookkeeper roles only
+
+**When to use:**
+- Review expenses posted to QBO in last 7-90 days
+- Correct category, state, or date mistakes discovered after posting
+- Change bank transaction matches that were incorrect
+- Audit what was posted and verify accuracy
+
+**Layout:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Match History                          [Last 30 days ▼] [Search]│
+├─────────────────────────────────────────────────────────────────┤
+│ [Search vendor...] [7d][14d][30d][60d][90d] [Reset]             │
+│                                                                  │
+│ Date     │ Vendor        │ Category      │ State │ Amount  │ QBO│
+│──────────┼───────────────┼───────────────┼───────┼─────────┼────│
+│ Dec 28   │ Shell Oil     │ Fuel - COS    │ CA    │ $52.96  │9228│
+│ Dec 27   │ Marriott TX   │ Travel - COS  │ TX    │ $189.00 │9227│
+│ Dec 26   │ Office Depot  │ Office Supp   │ NC    │ $34.50  │9226│
+│ Dec 25   │ Hertz CA      │ Vehicle - COS │ CA    │ $112.45 │9225│
+│ ...                                                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Data Requirements:**
+- `zoho_expenses` WHERE status = 'posted'
+- Date filter: `qbo_posted_at >= NOW() - INTERVAL 'N days'`
+- Join to `bank_transactions` for match details
+- Search filter: `merchant_name ILIKE %term% OR vendor_name ILIKE %term%`
+
+**Features:**
+
+**1. Date Range Filters (Quick Buttons)**
+- Last 7 days
+- Last 14 days
+- Last 30 days (default)
+- Last 60 days
+- Last 90 days
+
+**2. Vendor Search**
+- Real-time text search across merchant_name and vendor_name
+- Case-insensitive wildcard matching
+- Clears on "Reset" button
+
+**3. Row Click → ReviewDetailPanel (Edit Mode)**
+- All fields editable: date, category, state, bank transaction
+- "Edit & Resubmit" button replaces standard actions
+- Previous QBO Purchase ID shown for reference
+- Corrections tracked in corrections JSONB field
+
+**4. Edit & Resubmit Flow**
+1. User clicks row to open detail panel
+2. User edits any field (date, category, state, bank transaction)
+3. User clicks "Edit & Resubmit" button
+4. Frontend calls `handleEditMatch()` in reviewActions.ts
+5. Function sends corrections to Human Approved Processor webhook:
+   ```
+   POST https://n8n.as3drivertraining.com/webhook/human-approved
+
+   Body: {
+     expense_id: "zoho_expense_id",
+     corrections: {
+       category: "new_category",
+       state: "new_state",
+       date: "2024-12-28",
+       bank_transaction_id: "uuid"
+     },
+     previous_qbo_purchase_id: "9228"
+   }
+   ```
+6. n8n workflow receives corrections and previous_qbo_purchase_id
+7. Workflow queries QBO for existing Purchase transaction
+8. Workflow creates new Purchase with corrected values
+9. Workflow updates/voids old Purchase (QBO rules dependent)
+10. Workflow updates zoho_expenses with new qbo_purchase_id
+11. Expense status remains 'posted' (successful reprocessing)
+12. Match History reflects updated values on next page load
+
+**Actions:**
+- **Edit & Resubmit:**
+  - Validates item is from zoho_expenses and status='posted'
+  - Builds corrections object with changed fields only
+  - Calls Human Approved Processor webhook
+  - On success: Shows success message, closes panel
+  - On failure: Shows error message, expense remains in list for retry
+
+**Error Handling:**
+- Webhook failures logged but don't change expense status
+- User sees: "Failed to resubmit: [error details]"
+- Expense remains in Match History for manual retry
+- Network errors retry automatically (React Query)
+
+**Navigation:**
+- Sidebar item: "Match History"
+- Icon: History (lucide-react)
+- Visibility: Only when user.role is 'admin' or 'bookkeeper'
+- Active state when on /match-history route
+
+**Table Columns:**
+| Column | Field | Format | Sort |
+|--------|-------|--------|------|
+| Date | expense_date | MMM DD | Yes |
+| Vendor | merchant_name or vendor_name | Truncate 30 chars | Yes |
+| Category | category_name | Truncate 20 chars | Yes |
+| State | state_tag | 2-letter code | Yes |
+| Amount | amount | $X,XXX.XX | Yes |
+| QBO | qbo_purchase_id | Last 4 digits | No |
+| Bank | bank_transactions.source | AMEX/WF badge | No |
+
+**Key Benefits:**
+- **Self-Service:** Bookkeepers fix mistakes without developer
+- **Audit Trail:** All corrections stored in corrections JSONB field
+- **QBO Accuracy:** Reprocessing ensures QBO matches corrections
+- **Time-Bound:** Only recent expenses shown (performance)
+- **Search/Filter:** Find specific expenses quickly
+- **Role Security:** Only admin/bookkeeper can access
+
+**Implementation Files:**
+- `MatchHistoryPage.tsx` - Main page component
+- `useMatchHistory.ts` - Data fetching hook
+- `postedExpenseNormalizer.ts` - Normalizes to ReviewItem
+- `handleEditMatch()` - Action handler in reviewActions.ts
 
 ---
 

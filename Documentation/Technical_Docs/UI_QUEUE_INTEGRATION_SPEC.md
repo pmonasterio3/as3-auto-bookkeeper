@@ -1,10 +1,10 @@
 # UI Queue Integration Specification
 
-**Version:** 1.1
+**Version:** 1.2
 **Created:** December 15, 2025
 **Status:** ✅ IMPLEMENTED
 **Priority:** Critical
-**Last Updated:** December 15, 2025
+**Last Updated:** December 28, 2025
 
 ---
 
@@ -973,6 +973,554 @@ An expense is flagged when:
 - State tag missing or invalid
 - Receipt validation failed
 - Business rule violation
+
+---
+
+## December 28, 2025: Editable Date Field for Flagged Expenses
+
+**Version:** 1.3
+**Status:** ✅ IMPLEMENTED
+
+### Feature Summary
+
+Users can now edit the expense date on flagged zoho_expenses items in the Review Queue.
+
+### Implementation Details
+
+**CorrectionData Interface Update:**
+```typescript
+export interface CorrectionData {
+  category?: string
+  state?: string
+  date?: string              // NEW: Corrected expense date (YYYY-MM-DD)
+  notes?: string
+  createVendorRule?: boolean
+  bankTransactionId?: string
+}
+```
+
+**ReviewDetailPanel Changes:**
+- Date field made editable for zoho_expenses items (HTML date input type)
+- hasChanges detection includes date changes
+- Corrected date passed in corrections parameter to action handlers
+- Date changes saved to zoho_expenses.expense_date
+- Date corrections tracked in corrections JSONB field
+
+**User Flow:**
+1. User clicks edit button on Date field
+2. HTML date picker opens (YYYY-MM-DD format)
+3. User selects corrected date
+4. hasChanges becomes true → "Save & Resubmit" button appears
+5. User clicks "Save & Resubmit"
+6. Database updated with new expense_date
+7. Human Approved Processor webhook receives corrected date
+8. Expense reprocessed with corrected date
+
+**Impact:**
+- Improves bank transaction matching (±3 day window recalculated from corrected date)
+- Fixes Monday.com event matching (date range overlap uses corrected date)
+- Ensures QBO Purchase accuracy (posted with corrected date)
+- Provides self-service correction (no database access needed)
+
+**Files Modified:**
+- `expense-dashboard/src/features/review/types.ts`
+- `expense-dashboard/src/features/review/components/ReviewDetailPanel.tsx`
+- `expense-dashboard/src/features/review/services/reviewActions.ts`
+
+---
+
+## December 28, 2025: Bank Transaction Editing Fixes
+
+**Version:** 1.2
+**Status:** ✅ IMPLEMENTED
+
+### Problems Identified
+
+#### Problem 1: Could Not Change Existing Bank Transaction Match
+
+**User Report:** "I can't change the matched bank transaction for flagged expenses that already have a match."
+
+**Root Cause:**
+- ReviewDetailPanel displayed existing bank transaction as read-only text
+- BankTransactionPicker only appeared when `!item.bankTransaction` (no existing match)
+- Conditional logic at line 321-343 prevented editing of existing matches
+
+**Impact:** Users unable to correct incorrectly matched bank transactions without database intervention.
+
+---
+
+#### Problem 2: Save & Resubmit Failed After State/Category Change
+
+**User Report:** "When I change the state and click Save & Resubmit, I get error 'Bank transaction match is required for resubmit'."
+
+**Root Cause:**
+1. Changing state/category set `hasChanges = true`
+2. This triggered "Save & Resubmit" button which called `resubmit` action
+3. `handleAction` passed `bankTransactionId: selectedBankTxn?.id || undefined`
+4. Since user didn't select a new bank transaction, `selectedBankTxn` was null
+5. `handleResubmit` required a bankTransactionId and failed
+
+**Impact:** Users could not resubmit expenses after correcting state/category without also changing bank transaction.
+
+---
+
+#### Problem 3: hasChanges Detected False Positives
+
+**Root Cause:**
+- `hasChanges = selectedBankTxn !== null` triggered even when user selected the SAME transaction already matched
+- This caused "Save & Resubmit" button to appear instead of "Approve"
+
+**Impact:** Confusing UX - button changed even though no actual changes were made.
+
+---
+
+### Solutions Implemented
+
+#### Solution 1: Added "Change" Button to Existing Match Display
+
+**File:** `expense-dashboard/src/features/review/components/ReviewDetailPanel.tsx`
+**Lines:** 329-335
+
+**Code Added:**
+```typescript
+{/* Allow changing bank transaction for zoho_expenses */}
+{item.sourceTable === 'zoho_expenses' && (
+  <button
+    onClick={() => setShowBankPicker(true)}
+    className="ml-auto text-[10px] text-[#C10230] hover:text-[#A00228] font-medium underline"
+  >
+    Change
+  </button>
+)}
+```
+
+**Behavior:**
+- Existing bank transaction displayed with green highlight and checkmark
+- "Change" link appears on the right side
+- Clicking "Change" opens BankTransactionPicker to select different transaction
+- User can keep existing match or choose different one
+
+---
+
+#### Solution 2: Made BankTransactionPicker Shared
+
+**File:** `expense-dashboard/src/features/review/components/ReviewDetailPanel.tsx`
+**Lines:** 410-423
+
+**Change:**
+- Moved BankTransactionPicker component outside conditional that checked `!item.bankTransaction`
+- Now shows for BOTH items without a match AND items with existing match
+- Picker adapts based on context:
+  - No existing match: "Find Bank Transaction Match" button
+  - Has existing match: "Change" link in display
+
+**Before:**
+```typescript
+{!item.bankTransaction && (
+  <BankTransactionPicker ... />
+)}
+```
+
+**After:**
+```typescript
+{/* BankTransactionPicker now always available for zoho_expenses */}
+<BankTransactionPicker ... />
+```
+
+---
+
+#### Solution 3: Updated handleAction Fallback Logic
+
+**File:** `expense-dashboard/src/features/review/components/ReviewDetailPanel.tsx`
+**Line:** 147
+
+**Code Changed:**
+```typescript
+// OLD: Only used selectedBankTxn
+bankTransactionId: selectedBankTxn?.id || undefined
+
+// NEW: Falls back to existing match
+bankTransactionId: selectedBankTxn?.id || item.bankTransaction?.id || undefined
+```
+
+**Behavior:**
+- If user selected a new bank transaction, use it
+- If user didn't select new transaction, use existing match (if present)
+- If neither exists, pass undefined
+- This allows state/category changes without requiring new bank transaction selection
+
+---
+
+#### Solution 4: Fixed hasChanges Detection
+
+**File:** `expense-dashboard/src/features/review/components/ReviewDetailPanel.tsx`
+**Lines:** 157-163
+
+**Code Changed:**
+```typescript
+// OLD: Any selection triggered hasChanges
+const hasChanges = selectedBankTxn !== null || category !== ... || state !== ...
+
+// NEW: Only changed selection triggers hasChanges
+const bankTxnChanged = selectedBankTxn !== null && selectedBankTxn.id !== item.bankTransaction?.id
+
+const hasChanges = category !== (item.predictions?.category || item.zoho?.categoryName || '') ||
+  state !== (item.predictions?.state || '') ||
+  vendor !== (item.vendor || '') ||
+  bankTxnChanged
+```
+
+**Behavior:**
+- `bankTxnChanged` is true ONLY when user selected a DIFFERENT bank transaction
+- Selecting the same transaction already matched does NOT trigger hasChanges
+- Button correctly shows "Approve" vs "Save & Resubmit" based on actual changes
+
+---
+
+### User Flow After Fixes
+
+#### Scenario 1: Change Existing Bank Transaction Match
+
+1. User views flagged expense with existing bank match (shows green highlight)
+2. User sees matched transaction: "AMEX - $52.96 - Dec 06 ✓" with "Change" link
+3. User clicks "Change" link
+4. BankTransactionPicker opens showing unmatched transactions
+5. User searches/filters to find correct transaction
+6. User clicks "Select" on correct transaction
+7. New selection displays with green highlight
+8. User clicks "Save & Resubmit"
+9. Both zoho_expenses and bank_transactions tables updated
+10. Expense reprocessed through queue
+
+---
+
+#### Scenario 2: Change State/Category Without Changing Bank Transaction
+
+1. User views flagged expense with existing bank match
+2. User changes state from CA to TX
+3. hasChanges becomes true (state changed)
+4. "Save & Resubmit" button appears
+5. User clicks "Save & Resubmit"
+6. handleAction called with:
+   - state: 'TX'
+   - bankTransactionId: item.bankTransaction.id (fallback to existing)
+7. zoho_expenses updated with new state
+8. Existing bank transaction match preserved
+9. Expense reprocessed successfully
+
+---
+
+#### Scenario 3: No Changes, Just Approve
+
+1. User views flagged expense with existing bank match
+2. User doesn't change anything
+3. hasChanges is false (no category/state/vendor/bank changes)
+4. "Approve" button shown (not "Save & Resubmit")
+5. User clicks "Approve"
+6. Expense approved without modifications
+7. Status updated to 'posted'
+
+---
+
+### Testing Checklist
+
+- [x] "Change" link appears next to existing bank transaction matches
+- [x] Clicking "Change" opens BankTransactionPicker
+- [x] BankTransactionPicker shows unmatched transactions within date range
+- [x] Selecting new transaction updates display with green highlight
+- [x] Changing state/category WITHOUT changing bank transaction works
+- [x] "Save & Resubmit" uses existing bank transaction as fallback
+- [x] hasChanges correctly detects only actual changes
+- [x] Selecting SAME transaction doesn't trigger hasChanges
+- [x] Button correctly shows "Approve" vs "Save & Resubmit"
+- [x] All updates persist to database correctly
+- [x] No console errors during any user flow
+
+---
+
+### Files Modified
+
+| File | Lines Changed | Purpose | Status |
+|------|--------------|---------|--------|
+| `expense-dashboard/src/features/review/components/ReviewDetailPanel.tsx` | 329-335 | Add "Change" button to existing match display | ✅ DONE |
+| `expense-dashboard/src/features/review/components/ReviewDetailPanel.tsx` | 410-423 | Make BankTransactionPicker shared | ✅ DONE |
+| `expense-dashboard/src/features/review/components/ReviewDetailPanel.tsx` | 147 | Update handleAction fallback logic | ✅ DONE |
+| `expense-dashboard/src/features/review/components/ReviewDetailPanel.tsx` | 157-163 | Fix hasChanges detection | ✅ DONE |
+
+---
+
+### Key Design Decisions
+
+**Why "Change" link instead of making the display editable?**
+- BankTransactionPicker is a complex component with search/filter/sort
+- Inline editing would clutter the display
+- "Change" link clearly indicates editability
+- Maintains clean read-only display when not editing
+
+**Why fall back to existing bank transaction?**
+- Users should be able to correct state/category without re-selecting bank transaction
+- Existing match is still valid after state/category change
+- Reduces unnecessary clicks and confusion
+- Prevents errors from requiring fields that shouldn't be required
+
+**Why check `selectedBankTxn.id !== item.bankTransaction?.id`?**
+- User might open picker, see existing match is correct, and select it again
+- This shouldn't trigger "Save & Resubmit" - no actual change occurred
+- Comparing IDs prevents false positives
+- Provides better UX - button only changes when actual changes made
+
+**Why show both "Change" and "Find" buttons?**
+- Different user mental models:
+  - "Change" = I know there's a match but it's wrong
+  - "Find" = I need to search for a match that's missing
+- Clear visual affordance of current state
+- Reduces confusion about what action to take
+
+---
+
+### Lessons Learned
+
+**1. Always Provide Edit UI for All Editable Fields**
+- Just because a field has a value doesn't mean it should be read-only
+- "Display with Change button" is a good pattern for complex selectors
+- Users need to correct mistakes, not just fill in blanks
+
+**2. Fallback Logic Prevents Unnecessary Errors**
+- Requiring field re-selection when existing value is valid causes frustration
+- `selectedValue || existingValue || undefined` pattern handles common cases
+- Consider what user is actually trying to accomplish, not just field state
+
+**3. Change Detection Should Compare Values, Not Selection State**
+- `selected !== null` is too naive - user might select same value
+- Compare actual values: `selected !== null && selected.id !== existing?.id`
+- Prevents false positives that confuse users
+
+**4. Complex Forms Need Explicit State Management**
+- Don't rely on "presence of selection" to determine if changes were made
+- Track each field's actual change: `categoryChanged || stateChanged || bankTxnChanged`
+- Boolean logic should match user's mental model of "has this changed?"
+
+---
+
+## December 28, 2025: Match History Page Implementation
+
+**Version:** 1.4
+**Status:** ✅ IMPLEMENTED
+
+### Feature Summary
+
+A new page that allows admin/bookkeeper users to review and edit recently posted expense matches. If corrections are needed, changes are sent to the Human Approved Processor for reprocessing.
+
+### Purpose
+
+After expenses are successfully posted to QBO, users may need to:
+- Review what was posted to ensure accuracy
+- Correct category, state, or date mistakes discovered after posting
+- Change bank transaction matches that were incorrect
+- Resubmit corrected expenses for reprocessing
+
+Previously, there was no UI for editing posted expenses - users had to modify the database directly.
+
+### User Flow
+
+1. User navigates to "Match History" in sidebar (visible only to admin/bookkeeper roles)
+2. Page displays recently posted expenses (default: last 30 days)
+3. User can filter by date range (7, 14, 30, 60, 90 days)
+4. User can search by vendor name
+5. Click any row to open ReviewDetailPanel in edit mode
+6. Edit category, state, date, or bank transaction match
+7. Click "Edit & Resubmit" to send corrections to Human Approved Processor
+8. n8n workflow reprocesses the expense with corrected values
+
+### Technical Implementation
+
+**New Files Created:**
+
+| File | Purpose |
+|------|---------|
+| `expense-dashboard/src/features/review/MatchHistoryPage.tsx` | Main page component with table, filters, search |
+| `expense-dashboard/src/features/review/hooks/useMatchHistory.ts` | Data fetching hook for posted expenses |
+| `expense-dashboard/src/features/review/normalizers/postedExpenseNormalizer.ts` | Normalizes posted zoho_expenses to ReviewItem interface |
+
+**Modified Files:**
+
+| File | Changes |
+|------|---------|
+| `expense-dashboard/src/features/review/types.ts` | Added 'posted' ItemType, 'edit_match' ReviewAction, 'posted' ReviewFilter |
+| `expense-dashboard/src/types/auth.ts` | Added 'match_history' NavItemKey with admin/bookkeeper visibility |
+| `expense-dashboard/src/features/review/constants.ts` | Added 'posted' to all type maps (priorities, colors, labels, icons, actions) |
+| `expense-dashboard/src/features/review/services/reviewActions.ts` | Added handleEditMatch() function |
+| `expense-dashboard/src/features/dashboard/ExceptionDashboard.tsx` | Added navigation item and page routing |
+| `expense-dashboard/src/features/review/index.ts` | Added MatchHistoryPage export |
+| `expense-dashboard/src/features/review/hooks/index.ts` | Added useMatchHistory export |
+| `expense-dashboard/src/features/review/components/ReviewCardHeader.tsx` | Added 'posted' icon (CheckCircle2) |
+
+### Data Source
+
+**Table:** `zoho_expenses` WHERE `status = 'posted'`
+
+**Columns Displayed:**
+- Date (expense_date)
+- Vendor (merchant_name or vendor_name)
+- Category (category_name)
+- State (state_tag)
+- Amount
+- Bank Transaction (description from joined bank_transactions)
+- QBO Purchase ID (qbo_purchase_id)
+- Posted Date (qbo_posted_at)
+
+**Query Details:**
+```typescript
+// useMatchHistory.ts
+const { data: expenses, error } = await supabase
+  .from('zoho_expenses')
+  .select(`
+    *,
+    bank_transactions (
+      id,
+      description,
+      source,
+      amount,
+      transaction_date
+    )
+  `)
+  .eq('status', 'posted')
+  .gte('qbo_posted_at', dateFilter)
+  .order('qbo_posted_at', { ascending: false })
+```
+
+### handleEditMatch() Function
+
+**Location:** `expense-dashboard/src/features/review/services/reviewActions.ts`
+
+**Signature:**
+```typescript
+async function handleEditMatch(
+  item: ReviewItem,
+  data?: CorrectionData
+): Promise<ActionResult>
+```
+
+**Workflow:**
+1. Validates item is from zoho_expenses table
+2. Validates item has been posted (status='posted')
+3. Builds corrections object with:
+   - category (if changed)
+   - state (if changed)
+   - date (if changed)
+   - bankTransactionId (if changed)
+4. Calls Human Approved Processor webhook:
+   ```
+   POST https://n8n.as3drivertraining.com/webhook/human-approved
+   ```
+5. Payload includes:
+   - expense_id (zoho_expense_id)
+   - corrections (category, state, date, bank_transaction_id)
+   - previous_qbo_purchase_id (for update tracking)
+6. On success: Returns success message, expense disappears from Match History
+7. On failure: Logs error, expense status reverts to 'posted' (not flagged)
+
+**Error Handling:**
+- Webhook failures are logged but don't change expense status
+- User sees error message: "Failed to resubmit: [error details]"
+- Expense remains in Match History for retry
+
+### UI Components
+
+**MatchHistoryPage Layout:**
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Match History                                    [Filters ▼] │
+├─────────────────────────────────────────────────────────────┤
+│ [Search vendor...] [Last 30 days ▼] [Reset]                 │
+│                                                              │
+│ Date     │ Vendor      │ Category      │ State │ Amount     │
+│──────────┼─────────────┼───────────────┼───────┼────────────│
+│ Dec 28   │ Shell Oil   │ Fuel - COS    │ CA    │ $52.96     │
+│ Dec 27   │ Marriott    │ Travel - COS  │ TX    │ $189.00    │
+│ Dec 26   │ Office Depot│ Office Supp   │ NC    │ $34.50     │
+│ ...                                                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**ReviewDetailPanel (Edit Mode):**
+- All fields editable (date, category, state, bank transaction)
+- "Edit & Resubmit" button instead of "Approve"
+- Previous QBO Purchase ID displayed for reference
+- Corrected values tracked in corrections JSONB field
+
+### Date Range Filters
+
+| Filter | SQL Condition |
+|--------|---------------|
+| Last 7 days | `qbo_posted_at >= NOW() - INTERVAL '7 days'` |
+| Last 14 days | `qbo_posted_at >= NOW() - INTERVAL '14 days'` |
+| Last 30 days (default) | `qbo_posted_at >= NOW() - INTERVAL '30 days'` |
+| Last 60 days | `qbo_posted_at >= NOW() - INTERVAL '60 days'` |
+| Last 90 days | `qbo_posted_at >= NOW() - INTERVAL '90 days'` |
+
+### Vendor Search
+
+Uses Supabase `.ilike()` filter with wildcard matching:
+```typescript
+.or(`merchant_name.ilike.%${searchTerm}%,vendor_name.ilike.%${searchTerm}%`)
+```
+
+### Navigation
+
+**Sidebar Item:**
+- Label: "Match History"
+- Icon: History (lucide-react)
+- Route: `/match-history`
+- Visibility: Only for users with role 'admin' or 'bookkeeper'
+
+**Added to:** `ExceptionDashboard.tsx` navigation configuration:
+```typescript
+{
+  id: 'match_history',
+  label: 'Match History',
+  icon: History,
+  path: '/match-history',
+  roles: ['admin', 'bookkeeper'],
+}
+```
+
+### Reprocessing Flow
+
+1. User clicks "Edit & Resubmit" in ReviewDetailPanel
+2. `handleEditMatch()` sends corrections to Human Approved Processor webhook
+3. n8n workflow receives corrections and previous_qbo_purchase_id
+4. Workflow queries QBO for existing Purchase transaction
+5. Workflow creates new Purchase with corrected values
+6. Workflow deletes or voids old Purchase (depends on QBO rules)
+7. Workflow updates zoho_expenses with new qbo_purchase_id
+8. Expense status remains 'posted' (successful reprocessing)
+9. Match History reflects updated values on next page load
+
+### Key Benefits
+
+- **Self-Service Corrections:** Bookkeepers can fix posted expenses without developer intervention
+- **Audit Trail:** All corrections tracked in corrections JSONB field
+- **QBO Accuracy:** Reprocessing ensures QBO reflects corrected values
+- **Time-Bound:** Only shows recent expenses (configurable date range)
+- **Search/Filter:** Find specific expenses quickly by vendor or date
+- **Role-Based Access:** Only admin/bookkeeper can access (security)
+
+### Files Modified Summary
+
+| File | Action | Status |
+|------|--------|--------|
+| `src/features/review/MatchHistoryPage.tsx` | NEW FILE | ✅ CREATED |
+| `src/features/review/hooks/useMatchHistory.ts` | NEW FILE | ✅ CREATED |
+| `src/features/review/normalizers/postedExpenseNormalizer.ts` | NEW FILE | ✅ CREATED |
+| `src/features/review/types.ts` | Added 'posted' ItemType, 'edit_match' ReviewAction, 'posted' ReviewFilter | ✅ UPDATED |
+| `src/types/auth.ts` | Added 'match_history' NavItemKey | ✅ UPDATED |
+| `src/features/review/constants.ts` | Added 'posted' to type maps | ✅ UPDATED |
+| `src/features/review/services/reviewActions.ts` | Added handleEditMatch() | ✅ UPDATED |
+| `src/features/dashboard/ExceptionDashboard.tsx` | Added navigation and routing | ✅ UPDATED |
+| `src/features/review/index.ts` | Added MatchHistoryPage export | ✅ UPDATED |
+| `src/features/review/hooks/index.ts` | Added useMatchHistory export | ✅ UPDATED |
+| `src/features/review/components/ReviewCardHeader.tsx` | Added 'posted' icon | ✅ UPDATED |
 
 ---
 
