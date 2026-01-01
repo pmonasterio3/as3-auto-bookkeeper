@@ -223,6 +223,22 @@ Start at 100, subtract:
 - Receipt has validation issues: -15 per issue
 - Amount mismatch with bank: -25
 
+## DATE HANDLING (CRITICAL FOR BANK MATCHING)
+
+Receipt dates are more accurate than Zoho expense dates. When analyzing receipts:
+
+1. **Extract the transaction date** from the receipt image
+2. **Compare to expense date** provided in the data
+3. **If dates differ, USE THE RECEIPT DATE** when searching for bank transaction matches
+4. Bank transactions should be matched by receipt date ± 2 days, not expense date
+
+Common date discrepancies:
+- Expense submitted days after purchase (use receipt date)
+- Credit card posting delay (receipt date = actual purchase)
+- Timezone differences (receipt date is authoritative)
+
+Include `receipt_date` and `date_corrected` in your JSON output.
+
 ## CRITICAL OUTPUT FORMAT
 
 Your response MUST start with exactly one of these words:
@@ -246,7 +262,9 @@ State: CA (from Zoho tag)
   "qbo_class_id": 1000000004,
   "vendor_name": "Target",
   "confidence": 98,
-  "match_type": "exact"
+  "match_type": "exact",
+  "receipt_date": "2025-12-26",
+  "date_corrected": true
 }
 ```
 
@@ -260,7 +278,9 @@ Needs human review to identify correct bank transaction.
 {
   "bank_transaction_id": null,
   "flag_reason": "No bank match found - manual review needed",
-  "confidence": 55
+  "confidence": 55,
+  "receipt_date": "2025-12-25",
+  "date_corrected": false
 }
 ```
 ```
@@ -270,18 +290,97 @@ Needs human review to identify correct bank transaction.
 2. **Confidence calculation** - Specific point deductions for each issue
 3. **Output format** - Must START with APPROVED or FLAGGED
 4. **Examples** - Shows exactly what responses should look like
+5. **Date handling** - Receipt date extraction for better bank matching
 
 ---
 
-### Fix 6: AI Agent User Prompt - Simplified
+### Fix 6: AI Agent User Prompt - Enhanced with Date Extraction
 
 **Location:** AI Agent node → User Message
 
-**Clarifications:**
+**Full User Prompt (copy exactly):**
+
+```
+## EXPENSE TO CATEGORIZE
+
+**Expense ID:** {{ $json.expense_id }}
+**Supabase ID:** {{ $json.supabase_id }}
+**Date (from Zoho):** {{ $json.date }}
+**Amount:** ${{ $json.amount }}
+**Merchant (from Zoho):** {{ $json.merchant_name }}
+**Category (from Zoho):** {{ $json.category_name }}
+**Description:** {{ $json.description || 'None' }}
+**State Tag (from Zoho):** {{ $json.state || 'None' }}
+**Payment Method:** {{ $json.paid_through }}
+**Receipt Path:** {{ $json.receipt_storage_path || 'NO RECEIPT' }}
+
+## MONDAY EVENT (if matched)
+
+{{ $json.monday_event ? JSON.stringify($json.monday_event, null, 2) : 'No Monday event matched for this expense.' }}
+
+## BANK TRANSACTIONS (potential matches)
+
+{{ JSON.stringify($json.bank_transactions || [], null, 2) }}
+
+## QBO ACCOUNTS
+
+{{ JSON.stringify($json.qbo_accounts || [], null, 2) }}
+
+## QBO CLASSES (for state tracking)
+
+{{ JSON.stringify($json.qbo_classes || [], null, 2) }}
+
+---
+
+## YOUR TASK
+
+1. **FIRST**: If receipt_storage_path exists, use the "Fetch Receipt Tool" to view and analyze the receipt image.
+
+2. **Validate the receipt** against the expense:
+   - Does the receipt amount match ${{ $json.amount }}?
+   - Does the merchant on receipt match "{{ $json.merchant_name }}"?
+   - **IMPORTANT: Extract the DATE from the receipt.** Does it match {{ $json.date }}?
+   - If receipt date differs from expense date, note this and USE THE RECEIPT DATE for bank matching.
+
+3. **Find the matching bank transaction** from the list provided.
+   - Use the RECEIPT DATE (if extracted) when looking for date matches
+   - Allow ± 2 days from receipt date for bank transaction matching
+   - If no match on receipt date, fall back to expense date
+
+4. **Determine the correct QBO account** for this expense type.
+
+5. **Determine the correct QBO class** (state) using:
+   - State tag from Zoho: "{{ $json.state }}"
+   - Monday event state (if matched)
+   - If "Other" → use NC (North Carolina / Admin)
+
+6. **Call the categorization_history tool** to record your decision.
+
+7. **Return your decision** in this exact JSON format:
+\`\`\`json
+{
+  "bank_transaction_id": "uuid or null",
+  "qbo_account_id": "number",
+  "qbo_account_name": "string",
+  "qbo_class_id": "number",
+  "qbo_class_name": "string",
+  "vendor_name": "string (cleaned)",
+  "confidence": 0-100,
+  "reasoning": "Brief explanation",
+  "receipt_validated": true/false,
+  "receipt_issues": ["array of any receipt problems"],
+  "receipt_date": "YYYY-MM-DD or null if no receipt/unreadable",
+  "date_corrected": true/false
+}
+\`\`\`
+```
+
+**Key Changes from Original:**
 1. Use `$json.merchant_name` not `$json.expense.merchant_name`
 2. Use `$json.category_name` not `$json.expense.category_name`
-3. Removed confusing nested references
-4. Added clear field mappings from expense data
+3. Added date extraction instruction in step 2
+4. Added receipt date priority for bank matching in step 3
+5. Added `receipt_date` and `date_corrected` to JSON output
 
 ---
 
@@ -462,4 +561,24 @@ const expense = $('Prepare Receipt Upload').first().json;
 
 **Status:** ✅ PRODUCTION READY - Verified with 7 test expenses, all processed correctly
 
-*Last Updated: December 28, 2025*
+---
+
+## Enhancement: Receipt Date Extraction (December 28, 2025)
+
+**Purpose:** Improve bank transaction matching by using receipt date instead of expense date.
+
+**Why This Matters:**
+- Zoho expense date = when employee submitted expense
+- Receipt date = when purchase actually occurred
+- Bank transaction date = when payment posted (usually same as receipt date)
+
+**Implementation:** Purely prompt-based - no code changes needed.
+
+The AI now:
+1. Extracts the date from receipt images
+2. Compares to expense date
+3. Uses receipt date (± 2 days) for bank matching
+4. Falls back to expense date if receipt unreadable
+5. Reports `receipt_date` and `date_corrected` in JSON output
+
+*Last Updated: December 28, 2025 (Date Extraction Enhancement)*

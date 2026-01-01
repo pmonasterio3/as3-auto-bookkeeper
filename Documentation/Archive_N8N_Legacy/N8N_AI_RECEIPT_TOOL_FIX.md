@@ -269,9 +269,13 @@ This allows the AI to see images returned by the Fetch Receipt Tool.
 2. **Validate the receipt** against the expense:
    - Does the receipt amount match ${{ $json.amount }}?
    - Does the merchant on receipt match "{{ $json.merchant }}"?
-   - Note any discrepancies in your response.
+   - **IMPORTANT: Extract the DATE from the receipt.** Does it match {{ $json.date }}?
+   - If receipt date differs from expense date, note this and USE THE RECEIPT DATE for bank matching.
 
 3. **Find the matching bank transaction** from the list provided.
+   - Use the RECEIPT DATE (if extracted) when looking for date matches
+   - Allow ± 2 days from receipt date for bank transaction matching
+   - If no match on receipt date, fall back to expense date
 
 4. **Determine the correct QBO account** for this expense type.
 
@@ -285,7 +289,7 @@ This allows the AI to see images returned by the Fetch Receipt Tool.
 7. **Return your decision** in this exact JSON format:
 ```json
 {
-  "bank_transaction_id": "uuid",
+  "bank_transaction_id": "uuid or null",
   "qbo_account_id": "number",
   "qbo_account_name": "string",
   "qbo_class_id": "number",
@@ -294,7 +298,9 @@ This allows the AI to see images returned by the Fetch Receipt Tool.
   "confidence": 0-100,
   "reasoning": "Brief explanation",
   "receipt_validated": true/false,
-  "receipt_issues": ["array of any receipt problems"]
+  "receipt_issues": ["array of any receipt problems"],
+  "receipt_date": "YYYY-MM-DD or null if no receipt/unreadable",
+  "date_corrected": true/false
 }
 ```
 ```
@@ -348,6 +354,22 @@ Start at 100, subtract:
 - State unclear: -20
 - Merchant name mismatch: -15
 - No receipt provided: -10
+
+## DATE HANDLING (CRITICAL FOR BANK MATCHING)
+
+Receipt dates are more accurate than Zoho expense dates. When analyzing receipts:
+
+1. **Extract the transaction date** from the receipt image
+2. **Compare to expense date** provided in the data
+3. **If dates differ, USE THE RECEIPT DATE** when searching for bank transaction matches
+4. Bank transactions should be matched by receipt date ± 2 days, not expense date
+
+Common date discrepancies:
+- Expense submitted days after purchase (use receipt date)
+- Credit card posting delay (receipt date = actual purchase)
+- Timezone differences (receipt date is authoritative)
+
+Include `receipt_date` and `date_corrected` in your JSON output.
 
 ## CRITICAL RULES
 
@@ -503,4 +525,17 @@ The AI Agent's core purpose IS to analyze receipts. This fix restores that funct
 
 ---
 
-*End of Fix Document*
+---
+
+## Enhancement: Receipt Date Extraction (December 28, 2025)
+
+Added date extraction from receipts to improve bank transaction matching:
+
+1. AI extracts transaction date from receipt image
+2. Compares to Zoho expense date
+3. Uses receipt date for bank matching (more accurate)
+4. Reports `receipt_date` and `date_corrected` in JSON output
+
+This is purely a prompt enhancement - no node changes required.
+
+*End of Fix Document - Updated December 28, 2025*

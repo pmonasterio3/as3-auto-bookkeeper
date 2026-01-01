@@ -2,3 +2,46 @@
 sample_files/
 .mcp.json
 CLAUDE.md
+
+# Lambda build artifacts
+lambda/.aws-sam/
+lambda/**/*.zip
+lambda/layers/common/python/__pycache__/
+**/__pycache__/
+
+# Lambda layer dependencies (too large for git)
+lambda/layers/common/python/annotated_types*/
+lambda/layers/common/python/anthropic*/
+lambda/layers/common/python/anyio*/
+lambda/layers/common/python/aws_lambda_powertools*/
+lambda/layers/common/python/aws_xray_sdk*/
+lambda/layers/common/python/botocore*/
+lambda/layers/common/python/certifi*/
+lambda/layers/common/python/dateutil/
+lambda/layers/common/python/distro*/
+lambda/layers/common/python/docstring_parser*/
+lambda/layers/common/python/h11*/
+lambda/layers/common/python/httpcore*/
+lambda/layers/common/python/httpx*/
+lambda/layers/common/python/idna*/
+lambda/layers/common/python/jiter*/
+lambda/layers/common/python/jmespath*/
+lambda/layers/common/python/pydantic*/
+lambda/layers/common/python/python_dateutil*/
+lambda/layers/common/python/six*/
+lambda/layers/common/python/sniffio*/
+lambda/layers/common/python/typing_extensions*/
+lambda/layers/common/python/typing_inspection*/
+lambda/layers/common/python/urllib3*/
+lambda/layers/common/python/wrapt*/
+lambda/layers/common/python/bin/
+
+# Playwright
+.playwright-mcp/
+expense-dashboard/playwright-report/
+expense-dashboard/test-results/
+
+# Windows artifacts
+NUL
+nul
+expense-dashboard/nul
