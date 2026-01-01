@@ -1,0 +1,2 @@
+# Process Expense function - dependencies come from CommonLayer
+# This file intentionally minimal - layer provides all shared deps

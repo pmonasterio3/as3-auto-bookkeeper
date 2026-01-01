@@ -1,0 +1,54 @@
+# AS3 Auto Bookkeeper - SAM Deployment Configuration
+# ===================================================
+
+version = 0.1
+
+[default]
+[default.global.parameters]
+stack_name = "as3-bookkeeper"
+
+[default.build.parameters]
+cached = true
+parallel = true
+use_container = false
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+confirm_changeset = true
+resolve_s3 = true
+s3_prefix = "as3-bookkeeper"
+region = "us-east-1"
+image_repositories = []
+
+# Production environment
+[prod]
+[prod.deploy.parameters]
+stack_name = "as3-bookkeeper-prod"
+s3_prefix = "as3-bookkeeper-prod"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+parameter_overrides = "Environment=prod"
+
+# Staging environment
+[staging]
+[staging.deploy.parameters]
+stack_name = "as3-bookkeeper-staging"
+s3_prefix = "as3-bookkeeper-staging"
+region = "us-east-1"
+confirm_changeset = false
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+parameter_overrides = "Environment=staging"
+
+# Development environment
+[dev]
+[dev.deploy.parameters]
+stack_name = "as3-bookkeeper-dev"
+s3_prefix = "as3-bookkeeper-dev"
+region = "us-east-1"
+confirm_changeset = false
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+parameter_overrides = "Environment=dev"

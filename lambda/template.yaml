@@ -1,0 +1,357 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: AS3 Auto Bookkeeper - Expense Automation Lambda Functions
+
+# ============================================================================
+# GLOBAL CONFIGURATION
+# ============================================================================
+Globals:
+  Function:
+    Timeout: 300  # 5 minutes - allows for AI processing + API calls
+    MemorySize: 1024  # 1GB - needed for Claude API and image processing
+    Runtime: python3.13
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: as3-bookkeeper
+        POWERTOOLS_METRICS_NAMESPACE: AS3Bookkeeper
+        LOG_LEVEL: INFO
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+  SupabaseUrl:
+    Type: String
+    Description: Supabase project URL
+    NoEcho: true
+
+  QBOCompanyId:
+    Type: String
+    Default: "123146088634019"
+    Description: QuickBooks Online Company ID
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+
+  # --------------------------------------------------------------------------
+  # API GATEWAY
+  # --------------------------------------------------------------------------
+  ExpenseApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "as3-bookkeeper-api-${Environment}"
+      StageName: !Ref Environment
+      Description: API for AS3 Expense Automation
+      Auth:
+        ApiKeyRequired: true
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          Throttle:
+            BurstLimit: 10
+            RateLimit: 5
+          Quota:
+            Limit: 1000
+            Period: DAY
+      Cors:
+        AllowMethods: "'POST, OPTIONS'"
+        AllowHeaders: "'Content-Type, X-Api-Key'"
+        AllowOrigin: "'*'"
+      Tags:
+        Project: AS3-Bookkeeper
+        Environment: !Ref Environment
+
+  # --------------------------------------------------------------------------
+  # DYNAMODB - QBO OAuth Token Storage
+  # --------------------------------------------------------------------------
+  QBOTokensTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "as3-qbo-tokens-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: AS3-Bookkeeper
+        - Key: Environment
+          Value: !Ref Environment
+
+  # --------------------------------------------------------------------------
+  # DYNAMODB - Idempotency Table
+  # --------------------------------------------------------------------------
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "as3-idempotency-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiration
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: AS3-Bookkeeper
+        - Key: Environment
+          Value: !Ref Environment
+
+  # --------------------------------------------------------------------------
+  # SNS - Error Notifications
+  # --------------------------------------------------------------------------
+  ErrorNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "as3-bookkeeper-errors-${Environment}"
+      DisplayName: AS3 Bookkeeper Errors
+      Tags:
+        - Key: Project
+          Value: AS3-Bookkeeper
+
+  # --------------------------------------------------------------------------
+  # LAMBDA LAYER - Common Dependencies
+  # --------------------------------------------------------------------------
+  CommonLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "as3-bookkeeper-common-${Environment}"
+      Description: Common utilities and models for AS3 Bookkeeper
+      ContentUri: layers/common/
+      CompatibleRuntimes:
+        - python3.13
+      RetentionPolicy: Retain
+
+  # --------------------------------------------------------------------------
+  # LAMBDA - Process Expense (Main AI Workflow)
+  # --------------------------------------------------------------------------
+  ProcessExpenseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "as3-process-expense-${Environment}"
+      Description: Main expense processing with Claude AI
+      Handler: handler.lambda_handler
+      CodeUri: functions/process_expense/
+      Layers:
+        - !Ref CommonLayer
+      Environment:
+        Variables:
+          SUPABASE_URL: !Ref SupabaseUrl
+          QBO_COMPANY_ID: !Ref QBOCompanyId
+          TOKENS_TABLE: !Ref QBOTokensTable
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+          ERROR_TOPIC_ARN: !Ref ErrorNotificationTopic
+      Events:
+        ProcessExpenseApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ExpenseApi
+            Path: /process-expense
+            Method: POST
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref QBOTokensTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IdempotencyTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt ErrorNotificationTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:as3-bookkeeper-*"
+      Tags:
+        Project: AS3-Bookkeeper
+        Function: ProcessExpense
+
+  # --------------------------------------------------------------------------
+  # LAMBDA - Human Approved Processor
+  # --------------------------------------------------------------------------
+  HumanApprovedFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "as3-human-approved-${Environment}"
+      Description: Process human-approved expenses (bypass AI validation)
+      Handler: handler.lambda_handler
+      CodeUri: functions/human_approved/
+      Layers:
+        - !Ref CommonLayer
+      Environment:
+        Variables:
+          SUPABASE_URL: !Ref SupabaseUrl
+          QBO_COMPANY_ID: !Ref QBOCompanyId
+          TOKENS_TABLE: !Ref QBOTokensTable
+          ERROR_TOPIC_ARN: !Ref ErrorNotificationTopic
+      Events:
+        HumanApprovedApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ExpenseApi
+            Path: /human-approved
+            Method: POST
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref QBOTokensTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt ErrorNotificationTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:as3-bookkeeper-*"
+      Tags:
+        Project: AS3-Bookkeeper
+        Function: HumanApproved
+
+  # --------------------------------------------------------------------------
+  # LAMBDA - Recover Stuck Expenses (Scheduled)
+  # --------------------------------------------------------------------------
+  RecoverStuckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "as3-recover-stuck-${Environment}"
+      Description: Reset expenses stuck in processing state
+      Handler: handler.lambda_handler
+      CodeUri: functions/recover_stuck/
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+        - !Ref CommonLayer
+      Environment:
+        Variables:
+          SUPABASE_URL: !Ref SupabaseUrl
+          ERROR_TOPIC_ARN: !Ref ErrorNotificationTopic
+      Events:
+        ScheduledRecovery:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Check for stuck expenses every 5 minutes
+            Enabled: true
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:as3-bookkeeper-*"
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt ErrorNotificationTopic.TopicName
+      Tags:
+        Project: AS3-Bookkeeper
+        Function: RecoverStuck
+
+  # --------------------------------------------------------------------------
+  # LAMBDA - Process Orphan Transactions (Agent 2 - Scheduled)
+  # --------------------------------------------------------------------------
+  ProcessOrphansFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "as3-process-orphans-${Environment}"
+      Description: Process orphan bank transactions (Agent 2)
+      Handler: handler.lambda_handler
+      CodeUri: functions/process_orphans/
+      Layers:
+        - !Ref CommonLayer
+      Environment:
+        Variables:
+          SUPABASE_URL: !Ref SupabaseUrl
+          QBO_COMPANY_ID: !Ref QBOCompanyId
+          TOKENS_TABLE: !Ref QBOTokensTable
+          ERROR_TOPIC_ARN: !Ref ErrorNotificationTopic
+      Events:
+        DailyOrphanProcessing:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 6 * * ? *)  # 6 AM UTC daily
+            Description: Process orphan transactions daily
+            Enabled: true
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref QBOTokensTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt ErrorNotificationTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:as3-bookkeeper-*"
+      Tags:
+        Project: AS3-Bookkeeper
+        Function: ProcessOrphans
+
+  # --------------------------------------------------------------------------
+  # CLOUDWATCH ALARMS
+  # --------------------------------------------------------------------------
+  ProcessExpenseErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "as3-process-expense-errors-${Environment}"
+      AlarmDescription: Alert when expense processing has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessExpenseFunction
+      AlarmActions:
+        - !Ref ErrorNotificationTopic
+      TreatMissingData: notBreaching
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ExpenseApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiEndpoint"
+
+  ApiKeyId:
+    Description: API Key ID (retrieve value from console)
+    Value: !Ref ExpenseApiApiKey
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiKeyId"
+
+  ProcessExpenseFunctionArn:
+    Description: Process Expense Lambda ARN
+    Value: !GetAtt ProcessExpenseFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ProcessExpenseArn"
+
+  QBOTokensTableName:
+    Description: DynamoDB table for QBO tokens
+    Value: !Ref QBOTokensTable
+    Export:
+      Name: !Sub "${AWS::StackName}-TokensTable"
+
+  ErrorTopicArn:
+    Description: SNS Topic for error notifications
+    Value: !Ref ErrorNotificationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-ErrorTopic"

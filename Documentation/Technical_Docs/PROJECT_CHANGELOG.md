@@ -4,6 +4,69 @@
 
 ---
 
+## January 1, 2026: Date Inversion Auto-Correction in Bank Matching
+
+**STATUS:** Implemented automatic DD/MM vs MM/DD date inversion detection and correction.
+
+### Problem
+
+Expenses were being flagged with "No matching bank transaction" when the actual issue was date format confusion. Example:
+- Oliver's Markets receipt shows: Nov 3, 2025
+- Zoho recorded: March 11, 2025 (interpreted "11/03" as MM/DD instead of DD/MM)
+- Bank transaction exists on November 3rd, but no match found searching around March 11th
+
+### Solution
+
+Added automatic date inversion detection to `bank_matching.py`:
+
+1. **Primary search** - Try matching with original expense date
+2. **If no match AND day ≤ 12** (day could be valid month) - Try inverted date
+3. **If inverted date matches** - Use it and record correction for audit trail
+
+### Files Modified
+
+**`lambda/functions/process_expense/tools/bank_matching.py`**
+- Added `_try_date_inversion_match()` function (lines 157-270)
+- Swaps month/day and searches bank transactions in new date range
+- Records correction with `context.result.add_correction()`
+- Returns match with `date_correction` field containing original and corrected dates
+
+**`lambda/functions/process_expense/handler.py`**
+- Updated `_update_expense_success()` (lines 211-215)
+- Applies corrected `expense_date` to database (not just stores original)
+- Stores original in `original_expense_date` for audit trail
+
+**`lambda/functions/process_expense/prompts/expense_processor.py`**
+- Added instruction for AI agent to use corrected date from `date_correction.corrected` for QBO purchases
+
+### Example Behavior
+
+```
+Original expense date: 2025-03-11 (March 11)
+No match found in range [Mar 8 - Mar 14]
+Day (11) <= 12, attempting inversion...
+Inverted date: 2025-11-03 (November 3)
+Found match in range [Oct 31 - Nov 6]
+✓ Match found with date auto-corrected
+```
+
+### Database Changes
+
+When date is corrected:
+- `expense_date` → updated to corrected date (2025-11-03)
+- `original_expense_date` → stores original Zoho date (2025-03-11)
+- `corrections` JSONB → includes correction record for audit
+
+### Key Insight
+
+The inversion only works when day ≤ 12 because:
+- `03/11` could be March 11 or November 3
+- `25/03` can only be March 25 (25 is not a valid month)
+
+This silent auto-correction prevents legitimate expenses from being flagged for human review.
+
+---
+
 ## January 1, 2026: Human-Approved Processor Lambda Fixes
 
 **STATUS:** Human approval flow now fully operational via Lambda.

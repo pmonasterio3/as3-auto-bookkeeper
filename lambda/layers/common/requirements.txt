@@ -1,0 +1,14 @@
+# AS3 Auto Bookkeeper - Common Layer Dependencies
+# Minimal set - using httpx for Supabase to avoid dependency conflicts
+
+# AWS Lambda Powertools (core only)
+aws-lambda-powertools>=2.40.0
+
+# Anthropic SDK for Claude AI
+anthropic>=0.40.0
+
+# HTTP client for all API calls (Supabase, QBO, Monday)
+httpx>=0.25.0
+
+# Date parsing
+python-dateutil>=2.8.0
