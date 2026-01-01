@@ -4,45 +4,66 @@ import { BankFeedPanel } from './BankFeedPanel'
 import { SystemHealthBar } from './SystemHealthBar'
 import { AccountConsole } from './AccountConsole'
 import { TransactionTable } from './TransactionTable'
-import { ReviewQueue } from '@/features/review'
-import { VendorRulesPanel, ChartOfAccountsPanel, BankAccountsPanel } from '@/features/settings'
+import { ReviewQueue, MatchHistoryPage } from '@/features/review'
+import { VendorRulesPanel, ChartOfAccountsPanel, BankAccountsPanel, UserManagementPanel } from '@/features/settings'
 import { Button } from '@/components/ui/Button'
-import { LogOut, LayoutDashboard, Sparkles, BookOpen, CreditCard, ListTodo } from 'lucide-react'
+import { LogOut, LayoutDashboard, Sparkles, BookOpen, CreditCard, ListTodo, Users, History } from 'lucide-react'
+import type { NavItemKey } from '@/types/auth'
 
-type PageType = 'dashboard' | 'review' | 'vendor_rules' | 'chart_of_accounts' | 'bank_accounts'
+type PageType = 'dashboard' | 'review' | 'match_history' | 'vendor_rules' | 'chart_of_accounts' | 'bank_accounts' | 'users'
 
-const NAV_ITEMS = [
+const NAV_ITEMS: { key: PageType; navKey: NavItemKey; label: string; icon: typeof LayoutDashboard }[] = [
   {
-    key: 'dashboard' as PageType,
+    key: 'dashboard',
+    navKey: 'dashboard',
     label: 'Dashboard',
     icon: LayoutDashboard,
   },
   {
-    key: 'review' as PageType,
+    key: 'review',
+    navKey: 'review',
     label: 'Needs Attention',
     icon: ListTodo,
   },
   {
-    key: 'vendor_rules' as PageType,
+    key: 'match_history',
+    navKey: 'match_history',
+    label: 'Match History',
+    icon: History,
+  },
+  {
+    key: 'vendor_rules',
+    navKey: 'vendor_rules',
     label: 'Vendor Rules',
     icon: Sparkles,
   },
   {
-    key: 'chart_of_accounts' as PageType,
+    key: 'chart_of_accounts',
+    navKey: 'chart_of_accounts',
     label: 'Chart of Accounts',
     icon: BookOpen,
   },
   {
-    key: 'bank_accounts' as PageType,
+    key: 'bank_accounts',
+    navKey: 'bank_accounts',
     label: 'Bank Accounts',
     icon: CreditCard,
+  },
+  {
+    key: 'users',
+    navKey: 'users',
+    label: 'User Management',
+    icon: Users,
   },
 ]
 
 export function ExceptionDashboard() {
-  const { signOut, user } = useAuth()
+  const { signOut, user, canSeeNav } = useAuth()
   const [activePage, setActivePage] = useState<PageType>('dashboard')
   const [selectedAccount, setSelectedAccount] = useState<string | null>(null)
+
+  // Filter nav items based on user role
+  const visibleNavItems = NAV_ITEMS.filter(item => canSeeNav(item.navKey))
 
   return (
     <div className="min-h-screen bg-gray-50 flex">
@@ -59,7 +80,7 @@ export function ExceptionDashboard() {
 
         {/* Navigation */}
         <nav className="flex-1 p-3 space-y-1">
-          {NAV_ITEMS.map(item => {
+          {visibleNavItems.map(item => {
             const isActive = activePage === item.key
             return (
               <button
@@ -124,6 +145,12 @@ export function ExceptionDashboard() {
           </div>
         )}
 
+        {activePage === 'match_history' && (
+          <div className="max-w-6xl mx-auto px-6 py-4">
+            <MatchHistoryPage />
+          </div>
+        )}
+
         {activePage === 'vendor_rules' && (
           <div className="max-w-4xl mx-auto px-6 py-6">
             <div className="mb-6">
@@ -156,6 +183,18 @@ export function ExceptionDashboard() {
             </div>
             <div className="bg-white rounded-xl border border-gray-200 p-6">
               <BankAccountsPanel />
+            </div>
+          </div>
+        )}
+
+        {activePage === 'users' && (
+          <div className="max-w-4xl mx-auto px-6 py-6">
+            <div className="mb-6">
+              <h2 className="text-xl font-semibold text-gray-900">User Management</h2>
+              <p className="text-sm text-gray-500">Manage users, roles, and permissions</p>
+            </div>
+            <div className="bg-white rounded-xl border border-gray-200 p-6">
+              <UserManagementPanel />
             </div>
           </div>
         )}

@@ -1,6 +1,7 @@
 import { createBrowserRouter, RouterProvider, Navigate } from 'react-router-dom'
 import { AuthProvider, useAuth } from '@/features/auth/AuthProvider'
 import { LoginPage } from '@/features/auth/LoginPage'
+import { AcceptInvitePage } from '@/features/auth/AcceptInvitePage'
 import { ExceptionDashboard } from '@/features/dashboard/ExceptionDashboard'
 
 // Protected route wrapper
@@ -26,6 +27,10 @@ const router = createBrowserRouter([
   {
     path: '/login',
     element: <LoginPage />,
+  },
+  {
+    path: '/accept-invite',
+    element: <AcceptInvitePage />,
   },
   {
     path: '/',

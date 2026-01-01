@@ -7,21 +7,23 @@ import {
   AlertTriangle,
   AlertCircle,
   Clock,
+  CheckCircle2,
 } from 'lucide-react'
-import type { ReviewItem } from '../types'
+import type { ReviewItem, ItemType } from '../types'
 import { ITEM_TYPE_LABELS, ITEM_TYPE_COLORS } from '../constants'
 
 interface ReviewCardHeaderProps {
   item: ReviewItem
 }
 
-const TYPE_ICONS = {
+const TYPE_ICONS: Record<ItemType, typeof DollarSign> = {
   reimbursement: DollarSign,
   orphan: Building2,
   flagged: Flag,
   low_confidence: AlertTriangle,
   processing_error: AlertCircle,
   stuck: Clock,
+  posted: CheckCircle2,
 }
 
 export function ReviewCardHeader({ item }: ReviewCardHeaderProps) {

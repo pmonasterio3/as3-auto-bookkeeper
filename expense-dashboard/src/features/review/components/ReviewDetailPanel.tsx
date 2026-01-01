@@ -68,6 +68,7 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
   const [category, setCategory] = useState('')
   const [state, setState] = useState('')
   const [vendor, setVendor] = useState('')
+  const [expenseDate, setExpenseDate] = useState('')
   const [notes, setNotes] = useState('')
   const [createRule, setCreateRule] = useState(false)
 
@@ -92,6 +93,7 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
     setCategory(item.predictions?.category || item.zoho?.categoryName || '')
     setState(item.predictions?.state || '')
     setVendor(item.vendor || '')
+    setExpenseDate(item.date || '')
     setNotes('')
     setCreateRule(false)
     setEditingField(null)
@@ -141,9 +143,11 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
       await onAction(item, action, {
         category: category || undefined,
         state: state || undefined,
+        date: expenseDate !== item.date ? expenseDate : undefined,
         notes: notes || undefined,
         createVendorRule: createRule,
-        bankTransactionId: selectedBankTxn?.id || undefined,
+        // Use selected bank txn, or fall back to existing match
+        bankTransactionId: selectedBankTxn?.id || item.bankTransaction?.id || undefined,
       })
       onClose()
     } catch (err) {
@@ -153,10 +157,14 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
     }
   }
 
+  // Detect if user selected a DIFFERENT bank transaction (not just any selection)
+  const bankTxnChanged = selectedBankTxn !== null && selectedBankTxn.id !== item.bankTransaction?.id
+
   const hasChanges = category !== (item.predictions?.category || item.zoho?.categoryName || '') ||
     state !== (item.predictions?.state || '') ||
     vendor !== (item.vendor || '') ||
-    selectedBankTxn !== null
+    expenseDate !== (item.date || '') ||
+    bankTxnChanged
 
   const cosAccounts = qboAccounts.filter(a => a.is_cogs)
   const expenseAccounts = qboAccounts.filter(a => a.account_type === 'Expenses' && !a.is_cogs)
@@ -282,8 +290,14 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
 
                 <FieldRow
                   label="Date"
-                  value={formatDate(item.date)}
-                  readOnly
+                  value={expenseDate}
+                  isEditing={editingField === 'date'}
+                  onEdit={() => setEditingField('date')}
+                  onSave={() => setEditingField(null)}
+                  onChange={setExpenseDate}
+                  modified={expenseDate !== item.date}
+                  type="date"
+                  readOnly={item.sourceTable !== 'zoho_expenses'}
                 />
 
                 <FieldRow
@@ -317,16 +331,26 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
                 />
               </div>
 
-              {/* Bank Transaction */}
-              {item.bankTransaction && (
+              {/* Bank Transaction - Show existing match with option to change for zoho_expenses */}
+              {item.bankTransaction && !showBankPicker && (
                 <div className="p-3 bg-gray-50 rounded-lg border border-gray-200">
                   <div className="flex items-center gap-2 mb-2">
                     <CreditCard className="h-4 w-4 text-gray-500" />
                     <span className="text-[10px] font-semibold text-gray-600 uppercase tracking-wide">
                       {item.bankTransaction.source === 'amex' ? 'AMEX Card' : 'Wells Fargo'}
                     </span>
+                    {/* Allow changing bank transaction for zoho_expenses */}
+                    {item.sourceTable === 'zoho_expenses' && (
+                      <button
+                        onClick={() => setShowBankPicker(true)}
+                        className="ml-auto text-[10px] text-[#C10230] hover:text-[#A00228] font-medium underline"
+                      >
+                        Change
+                      </button>
+                    )}
                     <span className={cn(
-                      "ml-auto text-xs font-medium",
+                      item.sourceTable !== 'zoho_expenses' && "ml-auto",
+                      "text-xs font-medium",
                       item.amount === item.bankTransaction.amount ? 'text-green-600' : 'text-amber-600'
                     )}>
                       {formatCurrency(item.bankTransaction.amount)}
@@ -342,7 +366,7 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
                 </div>
               )}
 
-              {/* Manual Bank Transaction Matching (for zoho_expenses without match) */}
+              {/* Manual Bank Transaction Matching (for zoho_expenses - no match yet) */}
               {item.sourceTable === 'zoho_expenses' && !item.bankTransaction && (
                 <div className="space-y-2">
                   {/* Show selected bank transaction if user picked one */}
@@ -394,22 +418,22 @@ export function ReviewDetailPanel({ item, open, onClose, onAction }: ReviewDetai
                       </div>
                     </button>
                   )}
-
-                  {/* Bank Transaction Picker */}
-                  {showBankPicker && (
-                    <BankTransactionPicker
-                      expenseAmount={item.amount}
-                      expenseDate={item.date}
-                      expenseVendor={item.vendor}
-                      currentBankTxnId={selectedBankTxn?.id}
-                      onSelect={(txn) => {
-                        setSelectedBankTxn(txn)
-                        setShowBankPicker(false)
-                      }}
-                      onCancel={() => setShowBankPicker(false)}
-                    />
-                  )}
                 </div>
+              )}
+
+              {/* Bank Transaction Picker (shared for both changing existing match and finding new match) */}
+              {item.sourceTable === 'zoho_expenses' && showBankPicker && (
+                <BankTransactionPicker
+                  expenseAmount={item.amount}
+                  expenseDate={item.date}
+                  expenseVendor={item.vendor}
+                  currentBankTxnId={selectedBankTxn?.id || item.bankTransaction?.id}
+                  onSelect={(txn) => {
+                    setSelectedBankTxn(txn)
+                    setShowBankPicker(false)
+                  }}
+                  onCancel={() => setShowBankPicker(false)}
+                />
               )}
 
               {/* Error Details */}
@@ -726,7 +750,7 @@ interface FieldRowProps {
   onChange?: (value: string) => void
   modified?: boolean
   confidence?: number
-  type?: 'text' | 'select'
+  type?: 'text' | 'select' | 'date'
   options?: { group: string; items: string[] }[]
   isLast?: boolean
 }
@@ -780,6 +804,16 @@ function FieldRow({
                 </optgroup>
               ))}
             </select>
+          ) : type === 'date' ? (
+            <input
+              type="date"
+              value={value}
+              onChange={(e) => onChange?.(e.target.value)}
+              onBlur={onSave}
+              onKeyDown={(e) => e.key === 'Enter' && onSave?.()}
+              autoFocus
+              className="w-full text-right text-sm px-2 py-1 border border-gray-300 rounded-md focus:ring-2 focus:ring-[#C10230]"
+            />
           ) : (
             <input
               type="text"
@@ -800,7 +834,7 @@ function FieldRow({
               "text-sm",
               modified ? "text-amber-600 font-semibold" : "text-gray-900"
             )}>
-              {value || <span className="text-gray-400 italic">Not set</span>}
+              {value ? (type === 'date' ? formatDate(value) : value) : <span className="text-gray-400 italic">Not set</span>}
             </span>
             <Pencil className="h-3.5 w-3.5 text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity" />
           </button>

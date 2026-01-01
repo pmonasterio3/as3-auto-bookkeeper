@@ -22,10 +22,26 @@ export function formatCurrency(amount: number | string | null): string {
 
 /**
  * Format date for display
+ *
+ * Note: YYYY-MM-DD strings are parsed as local time (not UTC) to avoid
+ * timezone issues where dates appear as the previous day in US timezones.
  */
 export function formatDate(date: string | Date | null): string {
   if (!date) return '-'
-  const d = typeof date === 'string' ? new Date(date) : date
+
+  let d: Date
+  if (typeof date === 'string') {
+    // Check if it's a YYYY-MM-DD format (from date inputs)
+    // Append T00:00:00 to parse as local time instead of UTC
+    if (/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      d = new Date(date + 'T00:00:00')
+    } else {
+      d = new Date(date)
+    }
+  } else {
+    d = date
+  }
+
   return new Intl.DateTimeFormat('en-US', {
     month: 'short',
     day: 'numeric',

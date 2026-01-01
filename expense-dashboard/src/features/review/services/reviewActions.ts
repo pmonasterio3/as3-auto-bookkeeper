@@ -55,6 +55,12 @@ export async function executeReviewAction(
     case 'delete':
       return handleDelete(item)
 
+    case 'save_corrections':
+      return handleSaveCorrections(item, data)
+
+    case 'edit_match':
+      return handleEditMatch(item, data)
+
     default:
       return { success: false, message: `Unknown action: ${action}` }
   }
@@ -226,6 +232,15 @@ async function handleExclusion(item: ReviewItem): Promise<ActionResult> {
 async function handleRetry(item: ReviewItem): Promise<ActionResult> {
   // Handle stuck zoho_expenses
   if (item.sourceTable === 'zoho_expenses' && item.itemType === 'stuck') {
+    // Delete incomplete categorization_history to prevent false duplicate detection
+    if (item.zoho?.expenseId) {
+      await supabase
+        .from('categorization_history')
+        .delete()
+        .eq('zoho_expense_id', item.zoho.expenseId)
+        .is('qbo_transaction_id', null)
+    }
+
     // Reset expense to pending status for reprocessing
     const { error } = await supabase
       .from('zoho_expenses')
@@ -326,15 +341,55 @@ async function handleCreateVendorRule(
 }
 
 /**
- * Handle resubmit for zoho_expenses - reset to pending for reprocessing
+ * Map state tag to state code
+ */
+function mapStateTagToCode(stateTag: string | null | undefined): string {
+  const stateMap: Record<string, string> = {
+    'California': 'CA',
+    'Texas': 'TX',
+    'Colorado': 'CO',
+    'Washington': 'WA',
+    'New Jersey': 'NJ',
+    'Florida': 'FL',
+    'Montana': 'MT',
+    'Other': 'NC',
+    'Admin': 'NC',
+  }
+  return stateMap[stateTag || ''] || 'NC'
+}
+
+/**
+ * Map bank transaction source to paid_through value
+ * Bank transaction source is the SOURCE OF TRUTH for payment method
+ */
+function mapBankSourceToPaidThrough(source: string | null | undefined): string {
+  const sourceMap: Record<string, string> = {
+    'amex': 'AMEX Business',
+    'wf_as3dt': 'Wells Fargo Debit',
+    'wf_as3int': 'Wells Fargo AS3 International',
+  }
+  return sourceMap[source || ''] || 'Unknown'
+}
+
+/**
+ * Human Approved Processor endpoint
+ * Uses Supabase Edge Function as proxy to avoid CORS issues
+ * Edge Function -> Lambda (server-to-server)
+ */
+const HUMAN_APPROVED_URL = import.meta.env.VITE_HUMAN_APPROVED_URL ||
+  'https://fzwozzqwyzztadxgjryl.supabase.co/functions/v1/human-approved-proxy'
+
+/**
+ * Handle resubmit for zoho_expenses - calls AWS Lambda Human Approved Processor
  *
- * This is specific to the queue-based architecture v3.0. When a user
- * corrects a flagged expense and resubmits, we reset the status to 'pending'
- * so the queue controller will pick it up again and trigger n8n processing.
- *
- * If a manual bank transaction match is provided, we:
- * 1. Set bank_transaction_id on the zoho_expense
- * 2. Update the bank_transaction status to 'matched' with matched_expense_id
+ * When a human has reviewed and matched an expense, we call the Lambda which:
+ * 1. Fetches expense from Supabase
+ * 2. Applies any human corrections
+ * 3. Creates/finds vendor in QBO
+ * 4. Posts Purchase to QBO
+ * 5. Uploads receipt to QBO
+ * 6. Creates Monday.com subitem (for COS expenses)
+ * 7. Updates bank_transaction and zoho_expense statuses
  */
 async function handleResubmit(
   item: ReviewItem,
@@ -344,79 +399,141 @@ async function handleResubmit(
     return { success: false, message: 'Can only resubmit zoho_expenses items' }
   }
 
-  // Build update object - reset for reprocessing
-  const updates: Record<string, unknown> = {
-    status: 'pending',
-    processing_attempts: 0,
-    processing_started_at: null,
-    last_error: null,
-    updated_at: new Date().toISOString(),
+  // Require bank transaction match for resubmit
+  if (!data?.bankTransactionId) {
+    return { success: false, message: 'Bank transaction match is required for resubmit' }
   }
 
-  // Apply corrections if provided
-  if (data?.state) {
-    updates.state_tag = data.state
-  }
-  if (data?.category) {
-    updates.category_name = data.category
-  }
+  // Fetch the bank transaction to get corrected amount
+  const { data: bankTxn, error: fetchBankError } = await supabase
+    .from('bank_transactions')
+    .select('id, amount, description, transaction_date, source')
+    .eq('id', data.bankTransactionId)
+    .single()
 
-  // Handle manual bank transaction matching
-  if (data?.bankTransactionId) {
-    updates.bank_transaction_id = data.bankTransactionId
-    updates.match_confidence = 100 // Manual match = 100% confidence
-
-    // Update the bank_transactions table to mark as matched
-    const { error: bankError } = await supabase
-      .from('bank_transactions')
-      .update({
-        status: 'matched',
-        matched_expense_id: item.sourceId,
-        matched_at: new Date().toISOString(),
-        matched_by: 'human', // CHECK constraint only allows: 'agent', 'human', NULL
-      })
-      .eq('id', data.bankTransactionId)
-
-    if (bankError) {
-      console.error('Failed to update bank transaction:', bankError)
-      return { success: false, message: `Failed to link bank transaction: ${bankError.message}` }
-    }
+  if (fetchBankError || !bankTxn) {
+    console.error('Failed to fetch bank transaction:', fetchBankError)
+    return { success: false, message: `Failed to fetch bank transaction: ${fetchBankError?.message}` }
   }
 
-  const { error } = await supabase
+  // Use corrections if provided, otherwise use item data
+  const finalStateTag = data?.state || item.predictions?.state || 'Admin'
+  const finalState = mapStateTagToCode(finalStateTag)
+  const finalDate = data?.date || item.date
+
+  // Use bank transaction amount (source of truth)
+  const finalAmount = bankTxn.amount
+
+  // Build Lambda payload - simplified format per Lambda handler.py
+  const payload = {
+    expense_id: item.sourceId,
+    bank_transaction_id: data.bankTransactionId,
+    state: finalState,
+    corrections: {
+      ...(Math.abs(finalAmount - item.amount) > 0.01 && { amount: finalAmount }),
+      ...(data?.date && data.date !== item.date && { expense_date: data.date }),
+    },
+  }
+
+  console.log('Calling Lambda Human Approved Processor:', payload)
+
+  // Update expense status to 'processing' while we wait
+  const finalCategory = data?.category || item.predictions?.category || 'Office Supplies & Software'
+  const finalPaidThrough = mapBankSourceToPaidThrough(bankTxn.source)
+
+  await supabase
     .from('zoho_expenses')
-    .update(updates)
+    .update({
+      status: 'processing',
+      bank_transaction_id: data.bankTransactionId,
+      match_confidence: 100,
+      amount: finalAmount,
+      original_amount: Math.abs(finalAmount - item.amount) > 0.01 ? item.amount : null,
+      expense_date: finalDate,
+      category_name: finalCategory,
+      state_tag: finalStateTag,
+      paid_through: finalPaidThrough,
+      updated_at: new Date().toISOString(),
+    })
     .eq('id', item.sourceId)
 
-  if (error) {
-    return { success: false, message: `Failed to resubmit: ${error.message}` }
-  }
+  try {
+    // Call the Human Approved Processor via Edge Function proxy
+    const response = await fetch(HUMAN_APPROVED_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${(await supabase.auth.getSession()).data.session?.access_token}`,
+      },
+      body: JSON.stringify(payload),
+    })
 
-  // Create vendor rule if requested
-  if (data?.createVendorRule && item.vendor) {
-    await createVendorRule(
-      item.vendor,
-      data.category || item.predictions?.category || 'Office Supplies & Software',
-      data.state || item.predictions?.state || 'Admin'
-    )
-  }
+    const result = await response.json()
 
-  // Log correction if changes were made
-  if (data?.category || data?.state || data?.bankTransactionId) {
-    await logCorrection(
-      item,
-      data.category || item.predictions?.category || 'Office Supplies & Software',
-      data.state || item.predictions?.state || 'Admin'
-    )
-  }
+    if (!response.ok || !result.success) {
+      const errorMessage = result.error || result.message || `HTTP ${response.status}`
+      console.error('Lambda failed:', response.status, result)
 
-  const message = data?.bankTransactionId
-    ? 'Expense matched to bank transaction and resubmitted for processing'
-    : 'Expense resubmitted for processing'
+      // Revert status to flagged on failure
+      await supabase
+        .from('zoho_expenses')
+        .update({
+          status: 'flagged',
+          last_error: `Lambda failed: ${errorMessage}`,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', item.sourceId)
 
-  return {
-    success: true,
-    message,
+      return {
+        success: false,
+        message: `Failed to process: ${errorMessage}`,
+      }
+    }
+
+    // Lambda succeeded - update with QBO purchase ID
+    await supabase
+      .from('zoho_expenses')
+      .update({
+        status: 'posted',
+        qbo_purchase_id: result.qbo_purchase_id,
+        processed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', item.sourceId)
+
+    // Create vendor rule if requested
+    if (data?.createVendorRule && item.vendor) {
+      await createVendorRule(item.vendor, finalCategory, finalState)
+    }
+
+    const amountWasCorrected = Math.abs(finalAmount - item.amount) > 0.01
+    let message = result.message || 'Expense posted to QBO successfully'
+    if (amountWasCorrected) {
+      message = `Posted to QBO (amount corrected: $${item.amount.toFixed(2)} → $${finalAmount.toFixed(2)})`
+    }
+
+    return {
+      success: true,
+      message,
+      data: { qbo_purchase_id: result.qbo_purchase_id },
+    }
+  } catch (error) {
+    console.error('Lambda error:', error)
+
+    // Revert status to flagged on error
+    await supabase
+      .from('zoho_expenses')
+      .update({
+        status: 'flagged',
+        last_error: `Network error: ${error instanceof Error ? error.message : 'Unknown'}`,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', item.sourceId)
+
+    return {
+      success: false,
+      message: `Network error: ${error instanceof Error ? error.message : 'Failed to connect'}`,
+    }
   }
 }
 
@@ -474,6 +591,243 @@ async function handleDelete(item: ReviewItem): Promise<ActionResult> {
   return {
     success: true,
     message: 'Expense deleted successfully',
+  }
+}
+
+/**
+ * Handle save_corrections for submitters
+ *
+ * Saves corrections (category, state) to the expense but does NOT resubmit.
+ * The expense stays flagged for an admin/bookkeeper to review and resubmit.
+ * This allows submitters to fix their own mistakes without posting to QBO.
+ */
+async function handleSaveCorrections(
+  item: ReviewItem,
+  data?: CorrectionData
+): Promise<ActionResult> {
+  if (item.sourceTable !== 'zoho_expenses') {
+    return { success: false, message: 'Can only save corrections on zoho_expenses items' }
+  }
+
+  // Build update object with only the corrections
+  const updates: Record<string, unknown> = {
+    updated_at: new Date().toISOString(),
+  }
+
+  // Apply corrections if provided
+  if (data?.category) {
+    updates.category_name = data.category
+  }
+  if (data?.state) {
+    updates.state_tag = data.state
+  }
+  if (data?.date) {
+    updates.expense_date = data.date
+  }
+
+  // If bank transaction was selected, save it but don't process
+  if (data?.bankTransactionId) {
+    updates.bank_transaction_id = data.bankTransactionId
+    updates.match_confidence = 100 // Human matched = 100% confidence
+  }
+
+  // Store a note that corrections were made by submitter
+  updates.corrections = {
+    saved_at: new Date().toISOString(),
+    saved_by: 'submitter',
+    category: data?.category || null,
+    state: data?.state || null,
+    date: data?.date || null,
+    bank_transaction_id: data?.bankTransactionId || null,
+  }
+
+  const { error } = await supabase
+    .from('zoho_expenses')
+    .update(updates)
+    .eq('id', item.sourceId)
+
+  if (error) {
+    console.error('Failed to save corrections:', error)
+    return { success: false, message: `Failed to save corrections: ${error.message}` }
+  }
+
+  return {
+    success: true,
+    message: 'Corrections saved. An admin will review and resubmit.',
+  }
+}
+
+/**
+ * Handle edit_match for posted items - edit and reprocess through Lambda
+ *
+ * This is used when a match was already posted to QBO but needs correction.
+ * The Lambda will:
+ * 1. Process with human-provided corrections
+ * 2. Create new QBO Purchase (note: does NOT void previous - manual cleanup needed)
+ * 3. Update statuses
+ *
+ * IMPORTANT: The previous QBO transaction should be manually voided in QBO.
+ */
+async function handleEditMatch(
+  item: ReviewItem,
+  data?: CorrectionData
+): Promise<ActionResult> {
+  if (item.sourceTable !== 'zoho_expenses') {
+    return { success: false, message: 'Can only edit matches for zoho_expenses items' }
+  }
+
+  // Require bank transaction match for edit
+  const bankTxnId = data?.bankTransactionId || item.bankTransaction?.id
+  if (!bankTxnId) {
+    return { success: false, message: 'Bank transaction match is required' }
+  }
+
+  // Fetch the full expense data to get previous QBO ID
+  const { data: expenseData, error: fetchExpenseError } = await supabase
+    .from('zoho_expenses')
+    .select('qbo_purchase_id, expense_date, category_name, state_tag')
+    .eq('id', item.sourceId)
+    .single()
+
+  if (fetchExpenseError || !expenseData) {
+    console.error('Failed to fetch expense:', fetchExpenseError)
+    return { success: false, message: `Failed to fetch expense: ${fetchExpenseError?.message}` }
+  }
+
+  const previousQboId = expenseData.qbo_purchase_id
+
+  // Fetch the bank transaction
+  const { data: bankTxn, error: fetchBankError } = await supabase
+    .from('bank_transactions')
+    .select('id, amount, description, transaction_date, source')
+    .eq('id', bankTxnId)
+    .single()
+
+  if (fetchBankError || !bankTxn) {
+    console.error('Failed to fetch bank transaction:', fetchBankError)
+    return { success: false, message: `Failed to fetch bank transaction: ${fetchBankError?.message}` }
+  }
+
+  // Use corrections if provided, otherwise use expense data
+  const finalCategory = data?.category || expenseData.category_name || 'Office Supplies & Software'
+  const finalStateTag = data?.state || expenseData.state_tag || 'Admin'
+  const finalState = mapStateTagToCode(finalStateTag)
+  const finalDate = data?.date || expenseData.expense_date
+  const finalAmount = bankTxn.amount
+  const finalPaidThrough = mapBankSourceToPaidThrough(bankTxn.source)
+
+  // Build Lambda payload
+  const payload = {
+    expense_id: item.sourceId,
+    bank_transaction_id: bankTxnId,
+    state: finalState,
+    corrections: {
+      ...(Math.abs(finalAmount - item.amount) > 0.01 && { amount: finalAmount }),
+      ...(data?.date && data.date !== item.date && { expense_date: data.date }),
+    },
+  }
+
+  console.log('Calling Lambda Human Approved Processor for edit_match:', payload)
+
+  // Update expense status to 'processing' and store correction info
+  await supabase
+    .from('zoho_expenses')
+    .update({
+      status: 'processing',
+      bank_transaction_id: bankTxnId,
+      match_confidence: 100,
+      amount: finalAmount,
+      original_amount: Math.abs(finalAmount - item.amount) > 0.01 ? item.amount : null,
+      expense_date: finalDate,
+      category_name: finalCategory,
+      state_tag: finalStateTag,
+      paid_through: finalPaidThrough,
+      corrections: {
+        edited_at: new Date().toISOString(),
+        edited_by: 'human',
+        previous_qbo_purchase_id: previousQboId,
+        category: data?.category || null,
+        state: data?.state || null,
+        date: data?.date || null,
+        bank_transaction_id: bankTxnId,
+      },
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', item.sourceId)
+
+  try {
+    // Call the Human Approved Processor via Edge Function proxy
+    const response = await fetch(HUMAN_APPROVED_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${(await supabase.auth.getSession()).data.session?.access_token}`,
+      },
+      body: JSON.stringify(payload),
+    })
+
+    const result = await response.json()
+
+    if (!response.ok || !result.success) {
+      const errorMessage = result.error || result.message || `HTTP ${response.status}`
+      console.error('Lambda failed:', response.status, result)
+
+      // Revert status to 'posted' on failure (it was already posted before)
+      await supabase
+        .from('zoho_expenses')
+        .update({
+          status: 'posted',
+          last_error: `Edit failed: ${errorMessage}`,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', item.sourceId)
+
+      return {
+        success: false,
+        message: `Failed to process edit: ${errorMessage}`,
+      }
+    }
+
+    // Lambda succeeded - update with new QBO purchase ID
+    await supabase
+      .from('zoho_expenses')
+      .update({
+        status: 'posted',
+        qbo_purchase_id: result.qbo_purchase_id,
+        processed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', item.sourceId)
+
+    // Create vendor rule if requested
+    if (data?.createVendorRule && item.vendor) {
+      await createVendorRule(item.vendor, finalCategory, finalState)
+    }
+
+    return {
+      success: true,
+      message: previousQboId
+        ? `Match edited - new QBO #${result.qbo_purchase_id} (please void old #${previousQboId} in QBO)`
+        : `Match edited and posted to QBO #${result.qbo_purchase_id}`,
+      data: { qbo_purchase_id: result.qbo_purchase_id },
+    }
+  } catch (error) {
+    console.error('Lambda error:', error)
+
+    // Revert status to 'posted' on error
+    await supabase
+      .from('zoho_expenses')
+      .update({
+        status: 'posted',
+        last_error: `Network error: ${error instanceof Error ? error.message : 'Unknown'}`,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', item.sourceId)
+
+    return {
+      success: false,
+      message: `Network error: ${error instanceof Error ? error.message : 'Failed to connect'}`,
+    }
   }
 }
 

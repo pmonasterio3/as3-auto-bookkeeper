@@ -822,6 +822,148 @@ export type Database = {
         }
         Relationships: []
       }
+      user_profiles: {
+        Row: {
+          id: string
+          email: string
+          full_name: string
+          role: 'admin' | 'bookkeeper' | 'submitter'
+          linked_zoho_emails: string[]
+          is_active: boolean
+          invited_by: string | null
+          invited_at: string | null
+          last_login_at: string | null
+          org_id: string | null
+          created_at: string
+          updated_at: string
+        }
+        Insert: {
+          id: string
+          email: string
+          full_name: string
+          role?: 'admin' | 'bookkeeper' | 'submitter'
+          linked_zoho_emails?: string[]
+          is_active?: boolean
+          invited_by?: string | null
+          invited_at?: string | null
+          last_login_at?: string | null
+          org_id?: string | null
+          created_at?: string
+          updated_at?: string
+        }
+        Update: {
+          id?: string
+          email?: string
+          full_name?: string
+          role?: 'admin' | 'bookkeeper' | 'submitter'
+          linked_zoho_emails?: string[]
+          is_active?: boolean
+          invited_by?: string | null
+          invited_at?: string | null
+          last_login_at?: string | null
+          org_id?: string | null
+          created_at?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "user_profiles_id_fkey"
+            columns: ["id"]
+            isOneToOne: true
+            referencedRelation: "users"
+            referencedColumns: ["id"]
+          }
+        ]
+      }
+      external_identity_links: {
+        Row: {
+          id: string
+          user_id: string
+          provider: string
+          external_id: string
+          external_email: string | null
+          external_name: string | null
+          metadata: Json
+          is_primary: boolean
+          linked_at: string
+          linked_by: string | null
+        }
+        Insert: {
+          id?: string
+          user_id: string
+          provider: string
+          external_id: string
+          external_email?: string | null
+          external_name?: string | null
+          metadata?: Json
+          is_primary?: boolean
+          linked_at?: string
+          linked_by?: string | null
+        }
+        Update: {
+          id?: string
+          user_id?: string
+          provider?: string
+          external_id?: string
+          external_email?: string | null
+          external_name?: string | null
+          metadata?: Json
+          is_primary?: boolean
+          linked_at?: string
+          linked_by?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "external_identity_links_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "user_profiles"
+            referencedColumns: ["id"]
+          }
+        ]
+      }
+      user_invitations: {
+        Row: {
+          id: string
+          email: string
+          full_name: string
+          role: 'admin' | 'bookkeeper' | 'submitter'
+          token: string
+          invited_by: string
+          invited_at: string
+          expires_at: string
+          accepted_at: string | null
+          user_id: string | null
+          status: 'pending' | 'accepted' | 'expired' | 'revoked'
+        }
+        Insert: {
+          id?: string
+          email: string
+          full_name: string
+          role: 'admin' | 'bookkeeper' | 'submitter'
+          token?: string
+          invited_by: string
+          invited_at?: string
+          expires_at?: string
+          accepted_at?: string | null
+          user_id?: string | null
+          status?: 'pending' | 'accepted' | 'expired' | 'revoked'
+        }
+        Update: {
+          id?: string
+          email?: string
+          full_name?: string
+          role?: 'admin' | 'bookkeeper' | 'submitter'
+          token?: string
+          invited_by?: string
+          invited_at?: string
+          expires_at?: string
+          accepted_at?: string | null
+          user_id?: string | null
+          status?: 'pending' | 'accepted' | 'expired' | 'revoked'
+        }
+        Relationships: []
+      }
     }
     Views: {
       dashboard_stats: {
@@ -910,3 +1052,18 @@ export type QboClass = Database['public']['Tables']['qbo_classes']['Row']
 
 // Alias for consistency (also exported as QBOAccount)
 export type QboAccount = Database['public']['Tables']['qbo_accounts']['Row']
+
+// User Management types
+export type UserRole = 'admin' | 'bookkeeper' | 'submitter'
+export type UserProfile = Database['public']['Tables']['user_profiles']['Row']
+export type UserProfileInsert = Database['public']['Tables']['user_profiles']['Insert']
+export type UserProfileUpdate = Database['public']['Tables']['user_profiles']['Update']
+
+export type ExternalIdentityLink = Database['public']['Tables']['external_identity_links']['Row']
+export type ExternalIdentityLinkInsert = Database['public']['Tables']['external_identity_links']['Insert']
+export type ExternalIdentityLinkUpdate = Database['public']['Tables']['external_identity_links']['Update']
+
+export type UserInvitation = Database['public']['Tables']['user_invitations']['Row']
+export type UserInvitationInsert = Database['public']['Tables']['user_invitations']['Insert']
+export type UserInvitationUpdate = Database['public']['Tables']['user_invitations']['Update']
+export type InvitationStatus = 'pending' | 'accepted' | 'expired' | 'revoked'

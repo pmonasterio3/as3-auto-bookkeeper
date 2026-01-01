@@ -20,6 +20,7 @@ export type ItemType =
   | 'orphan'
   | 'processing_error'
   | 'stuck'
+  | 'posted'  // Successfully matched and posted expenses (for Match History)
 
 export type ReviewAction =
   | 'approve'
@@ -36,6 +37,8 @@ export type ReviewAction =
   | 'create_vendor_rule'
   | 'resubmit'
   | 'delete'
+  | 'save_corrections'  // Submitter-only: save corrections without resubmitting
+  | 'edit_match'        // Edit a posted match and reprocess
 
 export type PredictionMethod =
   | 'vendor_rule'
@@ -151,6 +154,7 @@ export type ReviewFilter =
   | 'orphan'
   | 'processing_error'
   | 'stuck'
+  | 'posted'  // Successfully posted expenses (for Match History)
 
 /**
  * Result from executing a review action
@@ -167,6 +171,7 @@ export interface ActionResult {
 export interface CorrectionData {
   category?: string
   state?: string
+  date?: string              // Corrected expense date (YYYY-MM-DD)
   notes?: string
   createVendorRule?: boolean
   bankTransactionId?: string  // For manual bank transaction matching

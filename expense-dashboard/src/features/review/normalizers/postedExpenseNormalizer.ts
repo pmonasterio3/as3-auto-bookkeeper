@@ -1,14 +1,15 @@
 /**
- * Normalizer for zoho_expenses items (Queue-based architecture v3.0)
+ * Normalizer for posted zoho_expenses items (Match History)
  *
- * Transforms zoho_expenses rows with status='flagged' into ReviewItem interface
- * for human review. These items were flagged due to low confidence, missing
- * data, or business rule violations during n8n processing.
+ * Transforms zoho_expenses rows with status='posted' into ReviewItem interface
+ * for viewing and editing completed matches. These items were successfully
+ * processed through n8n and posted to QBO.
  */
 
 import type { ZohoExpense, BankTransaction } from '@/types/database'
 import type { ReviewItem, ReviewAction, BankSource } from '../types'
 import { ITEM_TYPE_PRIORITIES } from '../constants'
+import { formatRelativeTime } from '@/lib/utils'
 
 // Report data from zoho_expense_reports join
 interface ZohoReportJoin {
@@ -47,74 +48,45 @@ function extractSubmitterFromPayload(rawPayload: unknown): string | null {
 }
 
 /**
- * Normalize a zoho_expenses item to the unified ReviewItem interface
+ * Normalize a posted zoho_expenses item to the unified ReviewItem interface
  *
- * @param expense - The zoho_expenses row from database
+ * @param expense - The zoho_expenses row from database (status='posted')
  * @param reportData - Joined data from zoho_expense_reports (optional)
- * @param bankTxn - Matched bank transaction (optional)
+ * @param bankTxn - Matched bank transaction (required for posted items)
  * @param receiptSignedUrl - Signed URL for receipt from Supabase Storage (optional)
  */
-export function normalizeZohoExpense(
+export function normalizePostedExpense(
   expense: ZohoExpense,
   reportData?: ZohoReportJoin | null,
   bankTxn?: BankTransaction | null,
   receiptSignedUrl?: string | null
 ): ReviewItem {
-  const itemType = 'flagged'
+  const itemType = 'posted'
 
-  // Determine available actions for zoho_expenses flagged items
-  const actions: ReviewAction[] = [
-    'approve',
-    'correct_and_approve',
-    'resubmit',
-    'reject',
-    'create_vendor_rule',
-  ]
+  // Available actions for posted items - can edit and reprocess
+  const actions: ReviewAction[] = ['edit_match', 'create_vendor_rule']
 
-  // Calculate days waiting
-  const daysWaiting = expense.created_at
-    ? Math.floor((Date.now() - new Date(expense.created_at).getTime()) / (1000 * 60 * 60 * 24))
+  // Calculate days since posting
+  const daysSincePosted = expense.processed_at
+    ? Math.floor((Date.now() - new Date(expense.processed_at).getTime()) / (1000 * 60 * 60 * 24))
     : 0
 
-  // Determine reason for flagging - build comprehensive reason with all issues
-  const issues: string[] = []
+  // Build info string showing when it was posted and QBO status
+  const postedInfo: string[] = []
 
-  // Check for processing error first
-  if (expense.last_error) {
-    issues.push(expense.last_error.length > 80
-      ? expense.last_error.substring(0, 80) + '...'
-      : expense.last_error)
+  if (expense.processed_at) {
+    postedInfo.push(`Posted ${formatRelativeTime(expense.processed_at)}`)
   }
 
-  // Check for bank transaction match issues
-  if (!expense.bank_transaction_id) {
-    issues.push('No bank transaction match found - manual match required')
+  if (expense.qbo_purchase_id) {
+    postedInfo.push(`QBO #${expense.qbo_purchase_id}`)
   }
 
-  // Check confidence level (only if we have a match but low confidence)
-  if (expense.bank_transaction_id && expense.match_confidence !== null && expense.match_confidence < 95) {
-    issues.push(`Low match confidence (${expense.match_confidence}%) - verify bank match is correct`)
+  if (expense.match_confidence !== null) {
+    postedInfo.push(`${expense.match_confidence}% confidence`)
   }
 
-  // Check for missing state
-  if (!expense.state_tag) {
-    issues.push('Missing state tag - assign state before resubmitting')
-  }
-
-  // Check for missing receipt
-  if (!expense.receipt_storage_path) {
-    issues.push('No receipt attached')
-  }
-
-  // Build final reason string
-  let reason: string
-  if (issues.length === 0) {
-    reason = 'Flagged for manual review'
-  } else if (issues.length === 1) {
-    reason = issues[0]
-  } else {
-    reason = issues.join(' • ')
-  }
+  const reason = postedInfo.length > 0 ? postedInfo.join(' | ') : 'Posted to QBO'
 
   return {
     // Identity
@@ -122,7 +94,7 @@ export function normalizeZohoExpense(
     sourceTable: 'zoho_expenses',
     sourceId: expense.id,
     itemType,
-    priority: ITEM_TYPE_PRIORITIES[itemType] || 1.5,
+    priority: ITEM_TYPE_PRIORITIES[itemType] || 10, // Low priority since already processed
 
     // Always visible
     amount: Number(expense.amount) || 0,
@@ -154,10 +126,10 @@ export function normalizeZohoExpense(
 
     // Dates
     date: expense.expense_date || '',
-    daysWaiting,
+    daysWaiting: daysSincePosted,
     createdAt: expense.created_at || '',
 
-    // Bank transaction if matched
+    // Bank transaction (should always have one for posted items)
     bankTransaction: bankTxn
       ? {
           id: bankTxn.id,
@@ -168,12 +140,12 @@ export function normalizeZohoExpense(
         }
       : undefined,
 
-    // AI predictions / parsed data
+    // Final values (not predictions for posted items)
     predictions: {
       category: expense.category_name,
       state: expense.state_tag,
-      confidence: expense.match_confidence || 0,
-      method: 'parsed',
+      confidence: expense.match_confidence || 100,
+      method: 'manual',
     },
 
     // Receipt from Supabase Storage
@@ -194,7 +166,7 @@ export function normalizeZohoExpense(
       submittedAt: reportData?.submitted_at || undefined,
     },
 
-    // Processing attempts (for display)
+    // Processing attempts (for reference)
     processingAttempts: expense.processing_attempts || 0,
 
     // Available actions

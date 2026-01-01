@@ -48,6 +48,7 @@ export const ITEM_TYPE_PRIORITIES: Record<string, number> = {
   flagged: 1.5,           // Flagged by AI
   orphan: 2,              // Bank transaction needs categorization
   low_confidence: 3,      // Matched but uncertain
+  posted: 10,             // Already processed - lowest priority for review
 }
 
 /**
@@ -95,6 +96,12 @@ export const ITEM_TYPE_COLORS: Record<string, {
     badge: 'bg-rose-100 text-rose-700',
     text: 'text-rose-700',
   },
+  posted: {
+    border: 'border-green-200',
+    header: 'bg-green-50',
+    badge: 'bg-green-100 text-green-700',
+    text: 'text-green-700',
+  },
 }
 
 /**
@@ -107,6 +114,7 @@ export const ITEM_TYPE_LABELS: Record<string, string> = {
   low_confidence: 'LOW CONFIDENCE',
   processing_error: 'PROCESSING ERROR',
   stuck: 'STUCK IN PROCESSING',
+  posted: 'POSTED TO QBO',
 }
 
 /**
@@ -119,6 +127,7 @@ export const ITEM_TYPE_ICONS: Record<string, string> = {
   low_confidence: 'AlertTriangle',
   processing_error: 'AlertCircle',
   stuck: 'Clock',
+  posted: 'CheckCircle2',
 }
 
 /**
@@ -131,6 +140,7 @@ export const DEFAULT_ACTIONS: Record<string, string[]> = {
   low_confidence: ['approve', 'correct_and_approve', 'reject'],
   processing_error: ['retry', 'investigate', 'resolve', 'ignore'],
   stuck: ['retry', 'reject'],
+  posted: ['edit_match', 'create_vendor_rule'],
 }
 
 /**

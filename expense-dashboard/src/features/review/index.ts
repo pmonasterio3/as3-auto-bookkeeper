@@ -1,5 +1,6 @@
-// Main component
+// Main components
 export { ReviewQueue } from './ReviewQueue'
+export { MatchHistoryPage } from './MatchHistoryPage'
 
 // Types
 export type {
