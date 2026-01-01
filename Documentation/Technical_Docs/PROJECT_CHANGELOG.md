@@ -4,6 +4,333 @@
 
 ---
 
+## January 1, 2026: Human-Approved Processor Lambda Fixes
+
+**STATUS:** Human approval flow now fully operational via Lambda.
+
+### Issues Fixed
+
+**1. Wrong Field Name for QBO Account ID**
+
+- **Symptom:** `QBO API returned 400` when trying to create purchase
+- **Root Cause:** Lambda handler was using `expense_account.get("qbo_account_id")` but database column is `qbo_id`
+- **Fix Location:** `lambda/functions/human_approved/handler.py` line 196
+- **Fix:** Changed to `expense_account.get("qbo_id")`
+
+**2. State Name Not Normalized**
+
+- **Symptom:** QBO Class lookup failed because "California" was passed instead of "CA"
+- **Root Cause:** Web app sends full state names but QBO API expects 2-letter codes
+- **Fix Location:** `lambda/functions/human_approved/handler.py` lines 27-52
+- **Fix:** Added `STATE_NAME_TO_CODE` mapping and `_normalize_state()` function
+
+```python
+STATE_NAME_TO_CODE = {
+    "california": "CA", "texas": "TX", "colorado": "CO",
+    "washington": "WA", "new jersey": "NJ", "florida": "FL",
+    "montana": "MT", "north carolina": "NC", "other": "NC"
+}
+```
+
+**3. Vendor Lookup Fails with Apostrophes (Oliver's Markets)**
+
+- **Symptom:** QBO query parser error for vendor names with apostrophes
+- **Error:** `QueryParserError: Encountered " <STRING> "'\'' "" at line 1, column 54`
+- **Root Cause:** Apostrophe escaping didn't work correctly in QBO SQL queries
+- **Secondary Issue:** When vendor lookup failed, create_vendor also failed with "Duplicate Name Exists"
+
+**4. Duplicate Vendor Error Not Handled**
+
+- **Symptom:** `QBO API returned 400` with error code 6240 "Duplicate Name Exists"
+- **Root Cause:** Vendor already exists in QBO but lookup failed, so create was attempted
+- **Fix Location:** `lambda/layers/common/python/utils/qbo_client.py` lines 180-217
+- **Fix:** Added try/catch in `create_vendor()` to handle duplicate error:
+  - Extract vendor ID from error message: `"The name supplied already exists. : Id=1248"`
+  - Fetch vendor by ID using new `get_vendor_by_id()` method
+
+### Test Results
+
+**Expense:** Oliver's Markets - $22.98 (Nov 3, 2025)
+- **QBO Purchase ID:** 9504
+- **Vendor ID:** 1248 (Oliver's Markets)
+- **Account:** 60 (Travel - Employee Meals)
+- **Class:** 1000000004 (California)
+- **Receipt:** Attached (Attachable ID 51050075)
+
+### Key Lessons
+
+1. **Database field names matter** - Always verify actual column names in database schema
+2. **Normalize inputs early** - Convert state names to codes before QBO API calls
+3. **Handle duplicate gracefully** - Extract ID from error message and fetch by ID
+4. **Apostrophes are tricky** - QBO query parser has issues; fallback to create+catch is reliable
+
+---
+
+## December 31, 2025: MAJOR ARCHITECTURE - Lambda Replaces n8n
+
+**STATUS:** n8n permanently shut down. System now uses AWS Lambda + Supabase Edge Functions.
+
+**Why This Change:**
+- n8n Cloud repeatedly hit memory limits with large expense reports
+- Self-hosted n8n was unreliable and difficult to maintain
+- Lambda provides better scalability, monitoring, and reliability
+- Edge Functions handle webhook/receipt fetching elegantly
+
+### New Architecture
+
+```
+┌─────────────┐     ┌─────────────────────┐     ┌─────────────┐
+│    Zoho     │────>│  Edge Function      │────>│  Supabase   │
+│   Expense   │     │  receive-zoho-      │     │  Database   │
+│  (webhook)  │     │  webhook            │     │             │
+└─────────────┘     └─────────────────────┘     └──────┬──────┘
+                              │                        │
+                              │ (fetch receipt)        │ (trigger)
+                              v                        v
+                    ┌─────────────────────┐     ┌─────────────┐
+                    │  Supabase Storage   │     │  pg_net     │
+                    │  (expense-receipts) │     │  HTTP call  │
+                    └─────────────────────┘     └──────┬──────┘
+                                                       │
+                                                       v
+                                               ┌─────────────┐
+                                               │ AWS Lambda  │
+                                               │ process-    │
+                                               │ expense     │
+                                               └─────────────┘
+```
+
+### Critical Bugs Fixed
+
+**1. Zoho OAuth Token Invalid (`invalid_code` error)**
+
+- **Symptom:** All expenses failed with "SYSTEM FAILURE: Receipt not fetched from Zoho API"
+- **Root Cause:** Stored `ZOHO_REFRESH_TOKEN` was expired/invalid
+- **Fix:** Generated new authorization code with scope `ZohoExpense.fullaccess.ALL`, exchanged for new refresh token
+- **Location:** Supabase Dashboard → Edge Functions → Secrets
+
+**2. Zoho Receipt API URL Format (HTTP 404 / "Invalid URL Passed")**
+
+- **Symptom:** Receipt fetch returned `{"code": 5, "message": "Invalid URL Passed"}`
+- **Root Cause:** Organization ID was in URL path instead of header
+- **Wrong:** `GET /organizations/{org_id}/expenses/{id}/receipt`
+- **Correct:** `GET /expenses/{id}/receipt` with header `X-com-zoho-expense-organizationid: {org_id}`
+- **Fix Location:** `supabase/functions/receive-zoho-webhook/index.ts` lines 90-100
+
+**3. Supabase Storage MIME Type ("mime type not supported")**
+
+- **Symptom:** `StorageApiError: mime type image/jpeg;charset=UTF-8 is not supported`
+- **Root Cause:** Zoho returns content-type with charset suffix, Supabase Storage rejects it
+- **Fix:** Strip charset suffix before upload: `contentType.split(';')[0].trim()`
+- **Fix Location:** `supabase/functions/receive-zoho-webhook/index.ts` lines 113-115
+
+### Production Results After Fix
+
+| Metric | Value |
+|--------|-------|
+| Expenses processed | 9 total |
+| Auto-posted to QBO | 5 (56%) |
+| Flagged for review | 4 (legitimate - no bank match) |
+| System errors | 0 |
+
+### Documentation Reorganization
+
+**Created:**
+- `Documentation/Archive_N8N_Legacy/` - All n8n docs moved here
+- `Documentation/Archive_N8N_Legacy/README.md` - Archive explanation
+- `Documentation/Technical_Docs/LAMBDA_ARCHITECTURE.md` - New system architecture
+- `Documentation/Technical_Docs/EDGE_FUNCTION_GUIDE.md` - Zoho OAuth, API details
+- `Documentation/Technical_Docs/TROUBLESHOOTING.md` - Error solutions
+
+**Moved to Archive:**
+- All `N8N_*.md` files
+- All `AGENT1_*.md` and `AGENT2_*.md` files
+- `THREE_AGENT_ARCHITECTURE.md`
+- `n8n-workflow-spec.md`
+- `MIGRATION_*.md` files
+
+### Key Lessons
+
+1. **Test OAuth tokens directly** - Don't assume they work; use curl to verify
+2. **Zoho API quirks** - Org ID goes in HEADER, not URL path
+3. **Content-Type handling** - Always strip charset suffixes for storage uploads
+4. **Documentation organization** - Archive deprecated systems immediately to prevent confusion
+
+---
+
+## December 29, 2025: Documentation Cleanup & Organization
+
+**STATUS:** ✅ COMPLETED - Cleaned up redundant Agent 1 documentation files.
+
+**Problem:**
+- Multiple overlapping Agent 1 fix documents created during debugging
+- Redundant files with different versions of the same code
+- Unclear which files were authoritative
+- Documentation folder was cluttered and hard to navigate
+
+**Files Deleted (Redundant/Outdated):**
+- `AGENT1_COMPLETE_UPDATE_GUIDE.md` - Superseded by AGENT1_UPDATE_GUIDE.md
+- `AGENT1_PARSE_AI_DECISION_BULLETPROOF.md` - Renamed to AGENT1_PARSE_AI_DECISION_CODE.md (became the canonical version)
+- `AGENT1_DEFINITIVE_FIX.md` - Consolidated into AGENT1_UPDATE_GUIDE.md
+- `ADD_VALIDATE_RECEIPT_NODE.md` - Approach was abandoned (receipt validation now handled by AI Agent)
+- `AI_AGENT_SYSTEM_PROMPT.md` - Outdated version, superseded by AGENT1_AI_PROMPT.md
+
+**Files Created:**
+- `AGENT1_UPDATE_GUIDE.md` - Comprehensive master guide for all Agent 1 updates
+- `README.md` - Documentation index with clear organization
+
+**Result:**
+- Clear structure: Architecture → Agent Docs → n8n Fixes → UI Specs → Planning
+- Single source of truth for each component
+- Easy to find the right documentation
+- Reduced confusion for new developers
+
+---
+
+## December 29, 2025: Agent 1 Confidence Scoring & Date Inversion Fixes
+
+**STATUS:** ✅ IMPLEMENTED - Multiple fixes to improve expense matching accuracy.
+
+### Problem 1: Low Confidence on Obvious Matches (80% instead of 100%)
+
+**Example:** "Bacon Bacon" expense matched to "TST* BACON BACON - SAN FRANCISCO" bank transaction was getting 80% confidence instead of 100%.
+
+**Root Cause:** AI Agent was re-evaluating merchant matching AFTER the Match Bank Transaction node already confirmed it. AI saw "extra text" in bank description and penalized -15 to -20 points.
+
+**Fix:** Updated AI Agent system prompt to TRUST the pre-calculated `bank_match_type`:
+- `exact` = 100% confidence (don't second-guess)
+- `amount_date_match` = 95% confidence
+- `amount_merchant_match` = 90% confidence
+- `amount_only_match` = 70% → FLAG
+- `no_match` = 50% → FLAG
+
+Only subtract points for ACTUAL issues (receipt amount mismatch, unreadable receipt).
+
+### Problem 2: Date Format Inversion (DD/MM vs MM/DD)
+
+**Example:** Receipt shows "11-10-2025" (November 10), but Zoho interpreted as "Oct 11, 2025" (10/11). Dates 30 days apart = no bank match found.
+
+**Root Cause:** Zoho sends dates in DD/MM/YYYY format from some regions, JavaScript interprets as MM/DD/YYYY.
+
+**Fix:** AI Agent now extracts the actual date from the receipt and reports it:
+```
+RECEIPT_DATE: 2025-11-10
+```
+
+Parse AI Decision node detects date inversions (>1 day difference) and passes correction data to Update Status nodes, which save the corrected date to the database.
+
+### Problem 3: Weak Merchant Matching (prefix-only)
+
+**Example:** "Vineyard Creek Chevron" expense didn't match "CHEVRON XXX5133" because old code only checked first 5 characters ("viney" ≠ "chevr").
+
+**Fix:** Updated Match Bank Transaction to use word-based matching:
+- Extract significant words (4+ chars) from merchant name
+- Check if ANY word appears in bank description
+- "chevron" from "Vineyard Creek Chevron" matches "CHEVRON XXX5133" ✓
+
+Also added ±3 day date tolerance instead of exact date match.
+
+### Files Created/Updated
+
+| File | Purpose |
+|------|---------|
+| `AGENT1_AI_PROMPT.md` | Full AI Agent system prompt (copy/paste ready) |
+| `AGENT1_PARSE_AI_DECISION_CODE.md` | Full Parse AI Decision code with date extraction |
+| `AGENT1_MATCH_BANK_TRANSACTION_CODE.md` | Full Match Bank Transaction code |
+| `AGENT1_UPDATE_STATUS_NODES.md` | Field expressions for status nodes |
+| `N8N_MATCH_BANK_TRANSACTION_FIX.md` | Technical documentation of matching fixes |
+
+### Database Migration Applied
+
+```sql
+ALTER TABLE zoho_expenses ADD COLUMN IF NOT EXISTS original_amount DECIMAL(10,2);
+ALTER TABLE zoho_expenses ADD COLUMN IF NOT EXISTS original_expense_date DATE;
+```
+
+### Expected Results After Fix
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| Exact match (amount+date+merchant) | 60-80% | 100% |
+| Date inversion (DD/MM vs MM/DD) | No match found | Date auto-corrected, match found |
+| Bank description has extra text | -15 penalty | No penalty (trusted) |
+
+---
+
+## December 28, 2025: Match History Page Implementation
+
+**STATUS:** ✅ IMPLEMENTED - Admin/bookkeeper users can now review and edit posted expenses.
+
+**Problem Solved:**
+- After expenses were posted to QBO, there was no UI to review or correct them
+- Bookkeepers had to manually query database to find posted expenses
+- Corrections required developer intervention to modify database directly
+- No audit trail of post-posting corrections
+
+**Solution: Match History Page**
+
+A dedicated page for reviewing recently posted expenses with full editing capabilities:
+
+**Key Features:**
+- View posted expenses from last 7-90 days (configurable filter)
+- Search by vendor name
+- Edit category, state, date, or bank transaction match
+- "Edit & Resubmit" sends corrections to Human Approved Processor
+- Previous QBO Purchase ID tracked for update handling
+- Full audit trail in corrections JSONB field
+
+**User Flow:**
+1. Navigate to "Match History" in sidebar (admin/bookkeeper only)
+2. View table of recently posted expenses (default: last 30 days)
+3. Click row to open ReviewDetailPanel in edit mode
+4. Make corrections to any field (date, category, state, bank transaction)
+5. Click "Edit & Resubmit" button
+6. Corrections sent to n8n Human Approved Processor webhook
+7. n8n reprocesses expense with corrected values
+8. Updates QBO Purchase transaction
+9. Match History reflects changes on next page load
+
+**Files Created:**
+- `MatchHistoryPage.tsx` - Main page component
+- `useMatchHistory.ts` - Data fetching hook (posted expenses)
+- `postedExpenseNormalizer.ts` - Normalizes zoho_expenses to ReviewItem
+
+**Files Modified:**
+- `types.ts` - Added 'posted' ItemType, 'edit_match' ReviewAction
+- `auth.ts` - Added 'match_history' NavItemKey with role restrictions
+- `constants.ts` - Added 'posted' to type maps (priorities, colors, labels, icons)
+- `reviewActions.ts` - Added handleEditMatch() function
+- `ExceptionDashboard.tsx` - Added navigation item and routing
+- `ReviewCardHeader.tsx` - Added CheckCircle2 icon for 'posted' items
+
+**handleEditMatch() Workflow:**
+1. Validates item is from zoho_expenses and status='posted'
+2. Builds corrections object (category, state, date, bankTransactionId)
+3. Calls Human Approved Processor webhook with corrections + previous_qbo_purchase_id
+4. On success: Expense disappears from Match History (status may change)
+5. On failure: Error logged, expense remains 'posted' for retry
+
+**Date Range Filters:**
+- Last 7 days
+- Last 14 days
+- Last 30 days (default)
+- Last 60 days
+- Last 90 days
+
+**Key Benefits:**
+- Self-service corrections (no developer needed)
+- Full audit trail of changes
+- QBO accuracy maintained through reprocessing
+- Role-based access control (security)
+- Time-bound view (only recent expenses shown)
+
+**Documentation Updated:**
+- UI_QUEUE_INTEGRATION_SPEC.md - Added Match History section
+- PROJECT_CHANGELOG.md (this file)
+- web-app-spec.md - Added Match History page specification
+
+---
+
 ## December 28, 2025: Human Approved Processor Query Vendor Fix
 
 **STATUS:** ✅ FIXED - Query Vendor node now correctly references Edit Fields node.
@@ -826,6 +1153,9 @@ return items.map(item => ({
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 3.0 | December 31, 2025 | MAJOR: Lambda replaces n8n, Zoho OAuth/API fixes, documentation reorganization |
+| 2.9 | December 29, 2025 | Confidence scoring fix (trust bank_match_type), date inversion auto-correction via AI, word-based merchant matching |
+| 2.8 | December 28, 2025 | Match History page implementation - review and edit posted expenses via UI |
 | 2.7 | December 28, 2025 | Lookup QBO Class node fix - use `state` abbreviation instead of `state_tag` full name |
 | 2.6 | December 28, 2025 | n8n workflow bank_transaction_id data flow fix, Parse AI Decision rewrite, AI prompt decision criteria, 43% auto-approval rate achieved |
 | 2.5 | December 28, 2025 | Review Queue bank transaction editing fixes, added Change button for existing matches, fixed Save & Resubmit fallback logic |
