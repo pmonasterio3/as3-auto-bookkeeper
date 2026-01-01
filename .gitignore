@@ -35,6 +35,8 @@ lambda/layers/common/python/typing_inspection*/
 lambda/layers/common/python/urllib3*/
 lambda/layers/common/python/wrapt*/
 lambda/layers/common/python/bin/
+lambda/layers/common/python/six.py
+lambda/layers/common/python/typing_extensions.py
 
 # Playwright
 .playwright-mcp/
